@@ -16,9 +16,28 @@
     margin-right: .8em;
 }
 
+/* Row action buttons (edit, pin, paste, tag, delete). The shell theme has
+   no hover style for plain buttons inside menus, so they get their own
+   round highlight. These values are for the dark style;
+   stylesheet-light.css overrides them for the light one. */
+.popup-menu-item .ci-action-btn {
+    margin-left:.25em;
+    padding:2px;
+    border-radius:99px;
+    transition-duration:100ms;
+}
+
+.popup-menu-item .ci-action-btn:hover,
+.popup-menu-item .ci-action-btn:focus {
+    background-color: rgba(255,255,255,0.15);
+}
+
+.popup-menu-item .ci-action-btn:active {
+    background-color: rgba(255,255,255,0.25);
+}
+
 .popup-menu-item .ci-action-btn StIcon {
     icon-size:1.2em;
-    margin-left:.25em;
 }
 
 .popup-menu-item StEntry StIcon {

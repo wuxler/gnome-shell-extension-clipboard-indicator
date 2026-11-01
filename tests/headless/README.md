@@ -24,6 +24,10 @@ CI_SCENARIO=corrupt CORRUPT=1 EXPECT_EXT_ERRORS=1 ./run.sh corrupt - - ./seed-50
 mkdir -p upstream-v71 && git archive v71 | tar -x -C upstream-v71 && glib-compile-schemas upstream-v71/schemas
 CI_SCENARIO=gtype EXTRA_EXT=./upstream-v71:clipboard-indicator@tudmotu.com \
   ENABLE_ONLY="'clipboard-indicator@tudmotu.com', 'ci-test@local'" ./run.sh gtype - - - 1 60
+
+# Menu rendering in the light or dark shell style: pin and tag
+# visibility, hover highlights, screenshots in runs/<tag>/visual-*.png.
+CI_SCENARIO=visual ./run.sh visual - - - 1 45 $'\n[org/gnome/desktop/interface]\ncolor-scheme=\'prefer-light\''
 ```
 
 `run.sh` exits non-zero unless the shell finished starting and, with the

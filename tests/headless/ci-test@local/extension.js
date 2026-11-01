@@ -1,6 +1,7 @@
 // Test driver for the clipboard-indicator fork. Runs once after shell
 // startup inside an isolated headless session (see ../run.sh) and logs
 // one "CI-TEST PASS|FAIL <name>" line per check, then "CI-TEST END ...".
+import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import GdkPixbuf from 'gi://GdkPixbuf';
@@ -8,6 +9,7 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const UUID = 'clipboard-indicator@wuxler.github.com';
@@ -156,6 +158,94 @@ export default class CiTest extends Extension {
             `state=${ext?.state} error=${ext?.error}`);
     }
 
+    // CI_SCENARIO=visual: open the menu, put the first history row's action
+    // buttons into :hover one at a time and take screenshots. Works with
+    // upstream too (it only uses the menu, not fork internals).
+    async _runVisual () {
+        const up = await waitFor(() => this._ind() !== undefined, 15000);
+        if (!up) return this._check('indicator present', false);
+        const ind = this._ind();
+        St.Clipboard.get_default().set_text(CLIP, 'visual check row');
+        await sleep(1500);
+        ind.menu.open();
+        await sleep(2500);
+
+        const rows = [];
+        const walk = actor => {
+            for (const child of actor.get_children()) {
+                if (child instanceof PopupMenu.PopupMenuItem && child.entry) rows.push(child);
+                walk(child);
+            }
+        };
+        walk(ind.menu.box);
+        const row = rows.find(r => r.entry.getStringValue() === 'visual check row') ?? rows[0];
+        this._check('history row found', !!row, `rows=${rows.length}`);
+        if (!row) return;
+
+        row.entry.setTag('ci tag');
+        ind._updateTagLabel(row);
+        await sleep(300);
+
+        const variant = Main.getStyleVariant();
+        const buttons = row.get_children().filter(c => c instanceof St.Button);
+        const rgba = actor => {
+            const c = actor.get_theme_node().get_foreground_color();
+            return [c.red, c.green, c.blue, c.alpha];
+        };
+        const bgAlpha = actor => actor.get_theme_node().get_background_color().alpha;
+        const shot = async name => {
+            const path = GLib.getenv('CI_SHOT').replace(/menu\.png$/, `${name}.png`);
+            const stream = Gio.File.new_for_path(path).replace(null, false, Gio.FileCreateFlags.NONE, null);
+            await new Promise((res, rej) => new Shell.Screenshot().screenshot(false, stream, (sh, r) => {
+                try { sh.screenshot_finish(r); res(); } catch (e) { rej(e); }
+            }));
+            stream.close(null);
+        };
+
+        // Visible means: not transparent and contrasting with the menu.
+        const visibleOn = ([r, g, b, a]) => a >= 0x40 && (variant === 'light' ? r < 0x80 && g < 0x80 && b < 0x80 : r >= 0x80);
+        const pin = buttons.find(btn => btn.style_class.includes('ci-pin-btn'));
+        this._check(`pin icon visible (${variant})`, pin && visibleOn(rgba(pin)), `color=${pin && rgba(pin)}`);
+        const tag = row.tagLabel;
+        this._check(`tag label visible (${variant})`, tag && visibleOn(rgba(tag)), `color=${tag && rgba(tag)}`);
+
+        await shot('visual-normal');
+        // Real pointer motion through a virtual device, so crossing events
+        // and hover tracking behave as with a mouse.
+        const seat = Clutter.get_default_backend().get_default_seat();
+        const pointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        const moveTo = (x, y) => pointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y);
+        const hoverOk = [];
+        for (const [i, btn] of buttons.entries()) {
+            const [bx, by] = btn.get_transformed_position();
+            const [bw, bh] = btn.get_transformed_size();
+            moveTo(bx + bw / 2, by + bh / 2);
+            await sleep(500);
+            await shot(`visual-hover-${i}`);
+            const others = buttons.filter(o => o !== btn).map(bgAlpha);
+            hoverOk.push(bgAlpha(btn) > 0 && others.every(alpha => alpha === 0));
+        }
+        this._check('hovered action button is highlighted, others are not',
+            hoverOk.length > 0 && hoverOk.every(x => x), JSON.stringify(hoverOk));
+        moveTo(10, 500);
+        await sleep(400);
+        this._check('no highlight after the pointer leaves', buttons.every(btn => bgAlpha(btn) === 0));
+
+        // Edit dialog, opened with the row's "e" key, for a visual check only.
+        const keyboard = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
+        const tap = keyval => {
+            keyboard.notify_keyval(GLib.get_monotonic_time(), keyval, Clutter.KeyState.PRESSED);
+            keyboard.notify_keyval(GLib.get_monotonic_time(), keyval, Clutter.KeyState.RELEASED);
+        };
+        row.grab_key_focus();
+        tap(Clutter.KEY_e);
+        await sleep(1000);
+        await shot('visual-edit');
+        tap(Clutter.KEY_Escape);
+        await sleep(500);
+        log(`INFO style variant=${variant}`);
+    }
+
     _ind () {
         return Main.panel.statusArea.clipboardIndicator;
     }
@@ -173,6 +263,7 @@ export default class CiTest extends Extension {
         const scenario = GLib.getenv('CI_SCENARIO');
         if (scenario === 'corrupt') return this._runCorrupt();
         if (scenario === 'gtype') return this._runGtype();
+        if (scenario === 'visual') return this._runVisual();
 
         const seeded = GLib.getenv('CI_SEEDED') === '1';
 
