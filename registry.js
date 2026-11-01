@@ -41,16 +41,26 @@ function loadFileContents (file) {
         (f, res) => f.load_contents_finish(res)[1], null);
 }
 
-async function writeFileContents (file, bytes) {
-    const stream = await callAsync(file, 'replace_async',
-        (f, res) => f.replace_finish(res),
-        null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_LOW, null);
-    await callAsync(stream, 'write_bytes_async',
-        (s, res) => s.write_bytes_finish(res),
-        bytes, GLib.PRIORITY_LOW, null);
-    await callAsync(stream, 'close_async',
-        (s, res) => s.close_finish(res),
-        GLib.PRIORITY_LOW, null);
+/** Suffix of files being written; see writeFileAtomically(). */
+const PARTIAL_SUFFIX = '.partial';
+
+/**
+ * Writes `bytes` to `path` so that `path` only ever holds complete data.
+ *
+ * Gio's replace creates a missing target directly and writes into it, so
+ * the final name would be visible (and look valid) while still being
+ * written, and would stay truncated after a crash. Writing to
+ * `<path>.partial` and renaming afterwards avoids both.
+ *
+ * @param {string} path
+ * @param {GLib.Bytes} bytes
+ */
+async function writeFileAtomically (path, bytes) {
+    const partial = Gio.file_new_for_path(path + PARTIAL_SUFFIX);
+    await callAsync(partial, 'replace_contents_bytes_async',
+        (f, res) => f.replace_contents_finish(res),
+        bytes, null, false, Gio.FileCreateFlags.NONE, null);
+    partial.move(Gio.file_new_for_path(path), FileCopyFlags.OVERWRITE, null, null);
 }
 
 /**
@@ -70,6 +80,8 @@ export class Registry {
     #pendingWrites = new Map();
     #thumbnailQueue = [];
     #runningThumbnails = 0;
+    #nextRegistry = null;
+    #registryWriting = null;
 
     constructor ({ settings, uuid }) {
         this.uuid = uuid;
@@ -108,15 +120,30 @@ export class Registry {
         this.writeToFile(registryContent);
     }
 
+    /**
+     * Writes the registry. Writes are serialized and coalesced: while one is
+     * in progress, only the most recent content is kept and written next,
+     * so an older snapshot can never land after a newer one.
+     */
     writeToFile (registry) {
-        const contents = new GLib.Bytes(JSON.stringify(registry));
+        this.#nextRegistry = new GLib.Bytes(JSON.stringify(registry));
+        if (this.#registryWriting) return;
 
-        GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
-
-        const file = Gio.file_new_for_path(this.REGISTRY_PATH);
-        writeFileContents(file, contents).catch(e => {
-            console.error('Clipboard Indicator: failed to write registry');
-            console.error(e);
+        this.#registryWriting = (async () => {
+            GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
+            while (this.#nextRegistry) {
+                const contents = this.#nextRegistry;
+                this.#nextRegistry = null;
+                try {
+                    await writeFileAtomically(this.REGISTRY_PATH, contents);
+                }
+                catch (e) {
+                    console.error('Clipboard Indicator: failed to write registry');
+                    console.error(e);
+                }
+            }
+        })().finally(() => {
+            this.#registryWriting = null;
         });
     }
 
@@ -127,14 +154,26 @@ export class Registry {
      * an entry is actually put on the clipboard. Entries whose image file is
      * missing are dropped.
      *
-     * @returns {Promise<ClipboardEntry[]>} entries, oldest first
+     * An oversized or unparsable registry is moved to `registry.txt~` and
+     * the history starts empty. Its image files are kept: pruneOrphanFiles()
+     * treats images referenced by the backup as in use.
+     *
+     * @returns {Promise<{entries: ClipboardEntry[], complete: boolean}>}
+     *   entries oldest first; `complete` is false if the registry could not
+     *   be loaded, in which case callers must not treat cached files as
+     *   unreferenced
      */
     async read () {
-        if (!GLib.file_test(this.REGISTRY_PATH, FileTest.EXISTS)) return [];
+        if (!GLib.file_test(this.REGISTRY_PATH, FileTest.EXISTS)) {
+            return { entries: [], complete: true };
+        }
 
         const file = Gio.file_new_for_path(this.REGISTRY_PATH);
         const maxRegistryBytes = this.settings.get_int(PrefsFields.CACHE_FILE_SIZE) * 1024 * 1024;
+        const moveAside = () => file.move(Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH),
+            FileCopyFlags.OVERWRITE, null, null);
 
+        let registry;
         try {
             const info = await callAsync(file, 'query_info_async',
                 (f, res) => f.query_info_finish(res),
@@ -142,23 +181,64 @@ export class Registry {
 
             // An oversized registry is moved aside instead of being parsed.
             if (info.get_size() >= maxRegistryBytes) {
-                file.move(Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH),
-                    FileCopyFlags.OVERWRITE, null, null);
-                return [];
+                moveAside();
+                return { entries: [], complete: false };
             }
 
             const contents = await loadFileContents(file);
             const text = new TextDecoder().decode(contents);
-            const registry = text.trim().length === 0 ? [] : JSON.parse(text);
-
-            return registry
-                .map(jsonEntry => ClipboardEntry.fromJSON(jsonEntry, this.REGISTRY_DIR))
-                .filter(entry => entry !== null);
+            registry = text.trim().length === 0 ? [] : JSON.parse(text);
+            if (!Array.isArray(registry)) throw new Error('registry is not an array');
         }
         catch (e) {
-            console.error('Clipboard Indicator: failed to read registry');
+            console.error('Clipboard Indicator: failed to read registry, moved it to ' +
+                this.BACKUP_REGISTRY_PATH);
             console.error(e);
-            return [];
+            // Keep the unreadable file: the next write would overwrite it.
+            try {
+                moveAside();
+            }
+            catch (moveError) {
+                console.error(moveError);
+            }
+            return { entries: [], complete: false };
+        }
+
+        const entries = [];
+        for (const jsonEntry of registry) {
+            try {
+                const entry = ClipboardEntry.fromJSON(jsonEntry, this.REGISTRY_DIR);
+                if (entry) entries.push(entry);
+            }
+            catch (e) {
+                console.error('Clipboard Indicator: skipping malformed registry entry');
+                console.error(e);
+            }
+        }
+        return { entries, complete: true };
+    }
+
+    /**
+     * @returns {Set<string>|null} image ids referenced by the backup
+     *   registry, an empty set if there is none, or null if it exists but
+     *   cannot be parsed (then nothing may be pruned)
+     */
+    #backupImageIds () {
+        if (!GLib.file_test(this.BACKUP_REGISTRY_PATH, FileTest.EXISTS)) return new Set();
+
+        try {
+            const [, contents] = GLib.file_get_contents(this.BACKUP_REGISTRY_PATH);
+            const backup = JSON.parse(new TextDecoder().decode(contents));
+            const ids = new Set();
+            for (const item of backup) {
+                if (!item?.mimetype?.startsWith('image/')) continue;
+                const id = item.id ?? GLib.path_get_basename(item.contents ?? '');
+                if (id) ids.add(String(id));
+            }
+            return ids;
+        }
+        catch (e) {
+            return null;
         }
     }
 
@@ -285,17 +365,20 @@ export class Registry {
 
         GLib.mkdir_with_parents(this.THUMBNAIL_DIR, parseInt('0775', 8));
 
-        // Encode to memory first, then write atomically through replace_async,
-        // so a half-written thumbnail is never picked up.
+        // Encode to memory, then write atomically, so a half-written
+        // thumbnail is never picked up.
         const [ok, buffer] = pixbuf.save_to_bufferv('png', [], []);
         if (!ok) throw new Error('could not encode thumbnail');
-        await writeFileContents(Gio.file_new_for_path(path), new GLib.Bytes(buffer));
+        await writeFileAtomically(path, new GLib.Bytes(buffer));
         return path;
     }
 
-    /** @returns {boolean} whether the entry's image is persisted on disk */
+    /**
+     * @returns {boolean} whether the entry's image is completely persisted
+     *   on disk, i.e. its in-memory bytes may be released
+     */
     hasEntryFile (entry) {
-        return this.#entryFileExists(entry);
+        return !this.#pendingWrites.has(entry.id()) && this.#entryFileExists(entry);
     }
 
     /**
@@ -303,14 +386,14 @@ export class Registry {
      * share one write.
      */
     writeEntryFile (entry) {
-        if (this.#entryFileExists(entry) || !entry.hasBytes()) return Promise.resolve();
-
+        // Checked first: a write in progress must be awaited, not skipped.
         const id = entry.id();
         if (this.#pendingWrites.has(id)) return this.#pendingWrites.get(id);
 
+        if (this.#entryFileExists(entry) || !entry.hasBytes()) return Promise.resolve();
+
         GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
-        const job = writeFileContents(
-            Gio.file_new_for_path(this.getEntryFilename(entry)), entry.asBytes())
+        const job = writeFileAtomically(this.getEntryFilename(entry), entry.asBytes())
             .catch(e => {
                 console.error('Clipboard Indicator: failed to cache image');
                 console.error(e);
@@ -320,7 +403,28 @@ export class Registry {
         return job;
     }
 
-    async deleteEntryFile (entry) {
+    /**
+     * Deletes an image entry's cached file and thumbnail.
+     *
+     * Waits for pending writes and thumbnail jobs of the same id first;
+     * otherwise a job finishing after the delete would recreate the files as
+     * orphans. If the same image was copied again while waiting, nothing is
+     * deleted.
+     *
+     * @param {ClipboardEntry} entry
+     * @param {function(string): boolean} [isReferenced] called with the
+     *   image id after pending jobs finished; return true to keep the files
+     */
+    async deleteEntryFile (entry, isReferenced = () => false) {
+        const id = entry.id();
+        for (;;) {
+            const pending = [this.#pendingWrites.get(id), this.#pendingThumbnails.get(id)]
+                .filter(job => job !== undefined);
+            if (pending.length === 0) break;
+            await Promise.allSettled(pending);
+        }
+        if (isReferenced(id)) return;
+
         for (const path of [this.getEntryFilename(entry), this.getThumbnailFilename(entry)]) {
             if (!GLib.file_test(path, FileTest.EXISTS)) continue;
             try {
@@ -337,14 +441,37 @@ export class Registry {
      * Deletes cached image files and thumbnails that no entry references,
      * e.g. left behind by an interrupted write or an older version.
      *
+     * Only names this cache creates are considered: `<id>` image files and
+     * `thumbnails/<id>.png`, where an id is a decimal hash, plus stale
+     * `*.partial` files of interrupted writes. Anything else,
+     * notably the `.goutputstream-*` temporaries of in-flight replace_async
+     * writes, is left alone. Images referenced by the backup registry count
+     * as referenced; if the backup cannot be parsed, nothing is deleted.
+     *
      * @param {function(string): boolean} isReferenced called for each file
      *   with its image id. It is evaluated per file rather than on a snapshot,
      *   so images copied while the scan runs are not deleted.
      */
     async pruneOrphanFiles (isReferenced) {
-        const keep = new Set([this.REGISTRY_FILE, this.REGISTRY_FILE + '~', THUMBNAIL_DIR]);
+        const backupIds = this.#backupImageIds();
+        if (backupIds === null) {
+            console.warn(`Clipboard Indicator: ${this.BACKUP_REGISTRY_PATH} is unreadable, not pruning the cache`);
+            return;
+        }
 
-        const prune = async (dir, idOf) => {
+        const isOrphanImage = id => !backupIds.has(id) && !isReferenced(id);
+
+        // Leftovers of interrupted writes, unless that write is running now.
+        const isStalePartial = name => {
+            if (name === this.REGISTRY_FILE + PARTIAL_SUFFIX) return !this.#registryWriting;
+            const image = name.match(/^(\d+)\.partial$/);
+            if (image) return !this.#pendingWrites.has(image[1]);
+            const thumb = name.match(/^(\d+)\.png\.partial$/);
+            if (thumb) return !this.#pendingThumbnails.has(thumb[1]);
+            return false;
+        };
+
+        const prune = async (dir, shouldDelete) => {
             const folder = Gio.file_new_for_path(dir);
             if (!GLib.file_test(dir, FileTest.IS_DIR)) return;
 
@@ -360,7 +487,7 @@ export class Registry {
 
                 for (const info of infos) {
                     const name = info.get_name();
-                    if (keep.has(name) || isReferenced(idOf(name))) continue;
+                    if (!shouldDelete(name)) continue;
                     try {
                         await callAsync(folder.get_child(name), 'delete_async',
                             (f, res) => f.delete_finish(res), GLib.PRIORITY_LOW, null);
@@ -374,8 +501,12 @@ export class Registry {
         };
 
         try {
-            await prune(this.REGISTRY_DIR, name => name);
-            await prune(this.THUMBNAIL_DIR, name => name.replace(/\.png$/, ''));
+            await prune(this.REGISTRY_DIR,
+                name => (/^\d+$/.test(name) && isOrphanImage(name)) || isStalePartial(name));
+            await prune(this.THUMBNAIL_DIR, name => {
+                const id = name.match(/^(\d+)\.png$/)?.[1];
+                return (id !== undefined && isOrphanImage(id)) || isStalePartial(name);
+            });
         }
         catch (e) {
             console.error('Clipboard Indicator: failed to prune cache');
