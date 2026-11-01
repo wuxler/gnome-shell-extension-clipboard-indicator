@@ -359,6 +359,7 @@ export default class CiTest extends Extension {
             const now = await clipboardText();
             this._check('image read does not override a later text selection',
                 now === 'ci text A' && ind._selectedEntry === text, `clipboard=${JSON.stringify(now)}`);
+            this._check('superseded image read is released', !image.hasBytes());
 
             ind._selectEntry(text);
             ind._selectEntry(image);
@@ -495,6 +496,66 @@ export default class CiTest extends Extension {
 
             for (const p of [temp, other, backedUp, orphan, stalePartial, ind.registry.BACKUP_REGISTRY_PATH])
                 GLib.unlink(p);
+        }
+
+        // --- registry edge cases, on a separate scratch registry ------------
+        {
+            const mod = await import(`file://${Main.extensionManager.lookup(UUID).path}/registry.js`);
+            const reg = new mod.Registry({ settings, uuid: 'ci-registry-test' });
+            const dir = reg.REGISTRY_DIR;
+            GLib.mkdir_with_parents(dir, 0o755);
+            const exists = p => GLib.file_test(p, GLib.FileTest.EXISTS);
+            const write = (name, text) => GLib.file_set_contents(`${dir}/${name}`, text);
+
+            // A record that fails to convert makes the load incomplete and
+            // keeps the original registry as the backup.
+            write('111', 'x');
+            write('222', 'x');
+            const original = JSON.stringify([
+                { favorite: false, mimetype: 'image/png', contents: `${dir}/111` },
+                { favorite: false, mimetype: 1, contents: `${dir}/222` },
+            ]);
+            write('registry.txt', original);
+            // run.sh does not count extension errors logged between these markers.
+            log('EXPECTED-ERRORS-BEGIN');
+            const { entries, complete } = await reg.read();
+            log('EXPECTED-ERRORS-END');
+            const [, backup] = GLib.file_get_contents(reg.BACKUP_REGISTRY_PATH);
+            this._check('malformed record makes the load incomplete and is backed up',
+                !complete && entries.length === 1 && new TextDecoder().decode(backup) === original,
+                `complete=${complete} entries=${entries.length}`);
+            await reg.pruneOrphanFiles(id => id === '111');
+            this._check('image of a malformed record survives pruning', exists(`${dir}/222`));
+
+            // A backup that is not an array disables pruning.
+            write('registry.txt~', '"just a string"');
+            write('333', 'x');
+            await reg.pruneOrphanFiles(() => false);
+            this._check('non-array backup disables pruning', exists(`${dir}/333`));
+
+            // A backup over the cache-size limit is not parsed.
+            const limit = settings.get_int('cache-size');
+            settings.set_int('cache-size', 1);
+            write('registry.txt~', JSON.stringify([{ mimetype: 'text/plain', contents: 'y'.repeat(1100 * 1024) }]));
+            write('444', 'x');
+            await reg.pruneOrphanFiles(() => false);
+            settings.set_int('cache-size', limit);
+            this._check('oversized backup disables pruning', exists(`${dir}/444`));
+
+            // Copying an image again while its files are being deleted must
+            // leave a complete, usable file.
+            const png = makePng(300, 200, 0x55aa33ff);
+            const first = new mod.ClipboardEntry('image/png', png, false);
+            await reg.writeEntryFile(first);
+            const deletion = reg.deleteEntryFile(first, () => false);
+            const again = new mod.ClipboardEntry('image/png', png, false);
+            const rewrite = reg.writeEntryFile(again);
+            await Promise.all([deletion, rewrite]);
+            this._check('recopy during deletion keeps the image file',
+                exists(reg.getEntryFilename(again)) && reg.hasEntryFile(again));
+
+            reg.clearCacheFolder();
+            Gio.File.new_for_path(dir).delete(null);
         }
 
         // --- clear history keeps pins --------------------------------------

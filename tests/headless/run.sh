@@ -151,7 +151,10 @@ if [ -n "$t_started" ]; then
 fi
 started=$(grep -c 'GNOME Shell started' "$T/shell.log")
 # Errors attributed to the extension under test (stack frames or messages).
-ext_errors=$(grep -cE "Extension $UUID:|Clipboard Indicator: (Failed|failed)|$UUID/[a-zA-Z]+\.js:[0-9]+:[0-9]+" "$T/shell.log")
+# Errors the driver provokes on purpose are bracketed by
+# EXPECTED-ERRORS-BEGIN/END markers and not counted.
+ext_errors=$(awk '/CI-TEST EXPECTED-ERRORS-BEGIN/{skip=1} /CI-TEST EXPECTED-ERRORS-END/{skip=0; next} !skip' "$T/shell.log" |
+  grep -cE "Extension $UUID:|Clipboard Indicator: (Failed|failed)|$UUID/[a-zA-Z]+\.js:[0-9]+:[0-9]+")
 disposed=$(grep -cE 'already disposed|impossible to access it' "$T/shell.log")
 echo "$TAG: startup=$dur started=$started alloc=$(grep -c 'needs an allocation' "$T/shell.log") js_errors=$(grep 'JS ERROR' "$T/shell.log" | grep -vc 'Xwayland exited') ext_errors=$ext_errors disposed=$disposed leftover=$leftover oom_kills=$oom_kills"
 grep -E 'CI-TEST' "$T/shell.log" | sed 's/.*CI-TEST/CI-TEST/'
