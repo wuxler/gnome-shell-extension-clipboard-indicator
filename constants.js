@@ -3,6 +3,8 @@ export const PrefsFields = {
     PREVIEW_SIZE                    : 'preview-size',
     CACHE_FILE_SIZE                 : 'cache-size',
     CACHE_ONLY_FAVORITE             : 'cache-only-favorites',
+    MAX_CACHED_IMAGES               : 'max-cached-images',
+    MAX_IMAGE_CACHE_SIZE            : 'max-image-cache-size',
     DELETE                          : 'enable-deletion',
     NOTIFY_ON_COPY                  : 'notify-on-copy',
     NOTIFY_ON_CYCLE                 : 'notify-on-cycle',
