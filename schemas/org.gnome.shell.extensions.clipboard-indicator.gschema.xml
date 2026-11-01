@@ -112,6 +112,27 @@
         <range min="1" max="1024"/>
     </key>
 
+    <key type="i" name="max-cached-images">
+        <default>50</default>
+        <summary>Maximum number of unpinned images kept in the history</summary>
+        <description>
+            When exceeded, the oldest unpinned images are removed from the
+            history and the cache. Pinned images do not count.
+        </description>
+        <range min="1" max="1000"/>
+    </key>
+
+    <key type="i" name="max-image-cache-size">
+        <default>100</default>
+        <summary>Maximum total size of cached unpinned images in MB</summary>
+        <description>
+            Images are stored as separate files and are not counted by
+            cache-size. When this limit is exceeded, the oldest unpinned
+            images are removed. The newest image is always kept.
+        </description>
+        <range min="1" max="10240"/>
+    </key>
+
     <key name="cache-only-favorites" type="b">
         <default>false</default>
         <summary>Disable the registry cache file for favorites and use memory only</summary>

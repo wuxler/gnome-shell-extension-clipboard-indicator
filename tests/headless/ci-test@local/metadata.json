@@ -1,0 +1,6 @@
+{
+    "uuid": "ci-test@local",
+    "name": "CI test driver",
+    "description": "Drives clipboard-indicator in an isolated headless shell and logs results",
+    "shell-version": ["46"]
+}

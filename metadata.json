@@ -6,10 +6,10 @@
         "49",
         "50"
     ],
-    "uuid": "clipboard-indicator@tudmotu.com",
-    "name": "Clipboard Indicator",
-    "description": "The most popular clipboard manager for GNOME, with over 1M downloads",
-    "url": "https://github.com/Tudmotu/gnome-shell-extension-clipboard-indicator",
+    "uuid": "clipboard-indicator@wuxler.github.com",
+    "name": "Clipboard Indicator (lazy history fork)",
+    "description": "Fork of Clipboard Indicator that loads clipboard history lazily and caps the image cache, so a large history cannot stall GNOME Shell startup. Based on Tudmotu/gnome-shell-extension-clipboard-indicator.",
+    "url": "https://github.com/wuxler/gnome-shell-extension-clipboard-indicator",
     "gettext-domain": "clipboard-indicator",
     "settings-schema": "org.gnome.shell.extensions.clipboard-indicator"
 }

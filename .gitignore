@@ -1,3 +1,8 @@
 *.zip
 
 .idea/
+
+# headless test artifacts
+tests/headless/runs/
+tests/headless/build/
+tests/headless/seed-*/

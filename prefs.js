@@ -66,6 +66,26 @@ class Settings {
             })
         });
 
+        this.field_max_cached_images = new Adw.SpinRow({
+            title: _("Max cached images"),
+            subtitle: _("Oldest unpinned images are removed beyond this number"),
+            adjustment: new Gtk.Adjustment({
+                lower: 1,
+                upper: 1000,
+                step_increment: 1
+            })
+        });
+
+        this.field_max_image_cache_size = new Adw.SpinRow({
+            title: _("Max image cache size (MB)"),
+            subtitle: _("Total size of cached unpinned images; the newest image is always kept"),
+            adjustment: new Gtk.Adjustment({
+                lower: 1,
+                upper: 10240,
+                step_increment: 10
+            })
+        });
+
         this.field_topbar_preview_size = new Adw.SpinRow({
             title: _("Number of characters in top bar"),
             subtitle: _("Length of the clipboard content preview shown in the panel"),
@@ -292,6 +312,8 @@ class Settings {
 
         this.limits.add(this.field_size);
         this.limits.add(this.field_cache_size);
+        this.limits.add(this.field_max_cached_images);
+        this.limits.add(this.field_max_image_cache_size);
         this.limits.add(this.field_cache_disable);
 
         this.topbar.add(this.field_display_mode);
@@ -318,6 +340,8 @@ class Settings {
         this.schema.bind(PrefsFields.HISTORY_SIZE, this.field_size, 'value', Gio.SettingsBindFlags.DEFAULT);
         this.schema.bind(PrefsFields.PREVIEW_SIZE, this.field_preview_size, 'value', Gio.SettingsBindFlags.DEFAULT);
         this.schema.bind(PrefsFields.CACHE_FILE_SIZE, this.field_cache_size, 'value', Gio.SettingsBindFlags.DEFAULT);
+        this.schema.bind(PrefsFields.MAX_CACHED_IMAGES, this.field_max_cached_images, 'value', Gio.SettingsBindFlags.DEFAULT);
+        this.schema.bind(PrefsFields.MAX_IMAGE_CACHE_SIZE, this.field_max_image_cache_size, 'value', Gio.SettingsBindFlags.DEFAULT);
         this.schema.bind(PrefsFields.CACHE_ONLY_FAVORITE, this.field_cache_disable, 'active', Gio.SettingsBindFlags.DEFAULT);
         this.schema.bind(PrefsFields.NOTIFY_ON_COPY, this.field_copy_notification_toggle, 'active', Gio.SettingsBindFlags.DEFAULT);
         this.schema.bind(PrefsFields.NOTIFY_ON_CYCLE, this.field_cycle_notification_toggle, 'active', Gio.SettingsBindFlags.DEFAULT);
