@@ -1,0 +1,27 @@
+/* Loaded instead of stylesheet.css when GNOME Shell uses its light style
+   (color-scheme 'prefer-light'). stylesheet.css assumes a dark menu and
+   uses translucent white in places, which is invisible on a light one. */
+@import url("stylesheet.css");
+
+/* Pin button of unpinned rows. */
+.ci-main-menu-section StButton.ci-pin-btn {
+    color: rgba(0,0,0,0.35);
+}
+
+.ci-tag-label {
+    color: rgba(0, 0, 0, 0.6);
+    background-color: rgba(0, 0, 0, 0.08);
+}
+
+.ci-edit-textbox {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.popup-menu-item .ci-action-btn:hover,
+.popup-menu-item .ci-action-btn:focus {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+
+.popup-menu-item .ci-action-btn:active {
+    background-color: rgba(0, 0, 0, 0.18);
+}
