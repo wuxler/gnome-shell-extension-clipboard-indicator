@@ -2195,7 +2195,12 @@ const ClipboardIndicator = GObject.registerClass({
         try {
             if (entry.isImage() && !entry.hasBytes()) {
                 await this.registry.loadEntryBytes(entry);
-                if (this._destroyed || request !== this.#clipboardRequest) return false;
+                if (this._destroyed || request !== this.#clipboardRequest) {
+                    // Superseded: do not keep the image in memory. A newer
+                    // request for the same entry reads it again if needed.
+                    if (this.registry.hasEntryFile(entry)) entry.releaseBytes();
+                    return false;
+                }
             }
             this.extension.clipboard.set_content(CLIPBOARD_TYPE, entry.mimetype(), entry.asBytes());
             if (entry.isImage() && this.registry.hasEntryFile(entry)) entry.releaseBytes();

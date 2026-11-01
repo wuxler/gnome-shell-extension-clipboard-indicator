@@ -78,6 +78,7 @@ async function writeFileAtomically (path, bytes) {
 export class Registry {
     #pendingThumbnails = new Map();
     #pendingWrites = new Map();
+    #pendingDeletes = new Map();
     #thumbnailQueue = [];
     #runningThumbnails = 0;
     #nextRegistry = null;
@@ -205,35 +206,67 @@ export class Registry {
         }
 
         const entries = [];
+        let malformed = 0;
         for (const jsonEntry of registry) {
             try {
                 const entry = ClipboardEntry.fromJSON(jsonEntry, this.REGISTRY_DIR);
                 if (entry) entries.push(entry);
             }
             catch (e) {
+                malformed++;
                 console.error('Clipboard Indicator: skipping malformed registry entry');
                 console.error(e);
             }
+        }
+
+        if (malformed > 0) {
+            // The next write would drop the skipped entries for good, and
+            // their images must not look unreferenced. Keep a copy of the
+            // original as the backup (which pruning honours) and report the
+            // load as incomplete.
+            try {
+                file.copy(Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH),
+                    FileCopyFlags.OVERWRITE, null, null);
+            }
+            catch (e) {
+                console.error(e);
+            }
+            return { entries, complete: false };
         }
         return { entries, complete: true };
     }
 
     /**
      * @returns {Set<string>|null} image ids referenced by the backup
-     *   registry, an empty set if there is none, or null if it exists but
-     *   cannot be parsed (then nothing may be pruned)
+     *   registry, an empty set if there is none, or null if it exists but is
+     *   too large, unparsable or not an array (then nothing may be pruned)
      */
     #backupImageIds () {
         if (!GLib.file_test(this.BACKUP_REGISTRY_PATH, FileTest.EXISTS)) return new Set();
 
         try {
+            // The backup is often the registry that read() refused for being
+            // too large; parsing it here would defeat that limit.
+            const maxBytes = this.settings.get_int(PrefsFields.CACHE_FILE_SIZE) * 1024 * 1024;
+            const size = Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH)
+                .query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null).get_size();
+            if (size >= maxBytes) return null;
+
             const [, contents] = GLib.file_get_contents(this.BACKUP_REGISTRY_PATH);
             const backup = JSON.parse(new TextDecoder().decode(contents));
+            if (!Array.isArray(backup)) return null;
+
+            // Deliberately conservative: any record whose id or contents
+            // basename looks like an image id protects that id, whatever its
+            // mimetype says. Protecting too much only delays cleanup.
             const ids = new Set();
             for (const item of backup) {
-                if (!item?.mimetype?.startsWith('image/')) continue;
-                const id = item.id ?? GLib.path_get_basename(item.contents ?? '');
-                if (id) ids.add(String(id));
+                if (item === null || typeof item !== 'object') continue;
+                for (const candidate of [item.id, typeof item.contents === 'string'
+                    ? GLib.path_get_basename(item.contents) : null]) {
+                    if (candidate !== undefined && candidate !== null && /^\d+$/.test(String(candidate)))
+                        ids.add(String(candidate));
+                }
             }
             return ids;
         }
@@ -317,12 +350,19 @@ export class Registry {
      */
     ensureThumbnail (entry) {
         const path = this.getThumbnailFilename(entry);
-        if (GLib.file_test(path, FileTest.EXISTS)) return Promise.resolve(path);
-
         const id = entry.id();
         if (this.#pendingThumbnails.has(id)) return this.#pendingThumbnails.get(id);
 
-        const job = this.#throttled(() => this.#createThumbnail(entry, path))
+        // As in writeEntryFile, a thumbnail being deleted is recreated
+        // once the deletion finished.
+        const deleting = this.#pendingDeletes.get(id);
+        if (!deleting && GLib.file_test(path, FileTest.EXISTS)) return Promise.resolve(path);
+
+        const job = (async () => {
+            if (deleting) await deleting;
+            if (GLib.file_test(path, FileTest.EXISTS)) return path;
+            return this.#throttled(() => this.#createThumbnail(entry, path));
+        })()
             .finally(() => this.#pendingThumbnails.delete(id));
         this.#pendingThumbnails.set(id, job);
         return job;
@@ -378,7 +418,9 @@ export class Registry {
      *   on disk, i.e. its in-memory bytes may be released
      */
     hasEntryFile (entry) {
-        return !this.#pendingWrites.has(entry.id()) && this.#entryFileExists(entry);
+        const id = entry.id();
+        return !this.#pendingWrites.has(id) && !this.#pendingDeletes.has(id) &&
+            this.#entryFileExists(entry);
     }
 
     /**
@@ -390,10 +432,18 @@ export class Registry {
         const id = entry.id();
         if (this.#pendingWrites.has(id)) return this.#pendingWrites.get(id);
 
-        if (this.#entryFileExists(entry) || !entry.hasBytes()) return Promise.resolve();
+        // A file that is being deleted does not count as existing: the
+        // write waits for the deletion and then recreates it.
+        const deleting = this.#pendingDeletes.get(id);
+        if (!entry.hasBytes()) return deleting ?? Promise.resolve();
+        if (!deleting && this.#entryFileExists(entry)) return Promise.resolve();
 
-        GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
-        const job = writeFileAtomically(this.getEntryFilename(entry), entry.asBytes())
+        const bytes = entry.asBytes();
+        const job = (async () => {
+            if (deleting) await deleting;
+            GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
+            await writeFileAtomically(this.getEntryFilename(entry), bytes);
+        })()
             .catch(e => {
                 console.error('Clipboard Indicator: failed to cache image');
                 console.error(e);
@@ -418,23 +468,30 @@ export class Registry {
     async deleteEntryFile (entry, isReferenced = () => false) {
         const id = entry.id();
         for (;;) {
-            const pending = [this.#pendingWrites.get(id), this.#pendingThumbnails.get(id)]
-                .filter(job => job !== undefined);
+            const pending = [this.#pendingWrites.get(id), this.#pendingThumbnails.get(id),
+                this.#pendingDeletes.get(id)].filter(job => job !== undefined);
             if (pending.length === 0) break;
             await Promise.allSettled(pending);
         }
         if (isReferenced(id)) return;
 
-        for (const path of [this.getEntryFilename(entry), this.getThumbnailFilename(entry)]) {
-            if (!GLib.file_test(path, FileTest.EXISTS)) continue;
-            try {
-                await callAsync(Gio.file_new_for_path(path), 'delete_async',
-                    (f, res) => f.delete_finish(res), GLib.PRIORITY_LOW, null);
+        // Registered synchronously after the last check, so a write or
+        // thumbnail job for the same image started from here on waits for
+        // the deletion and then recreates the files (see writeEntryFile).
+        const job = (async () => {
+            for (const path of [this.getEntryFilename(entry), this.getThumbnailFilename(entry)]) {
+                if (!GLib.file_test(path, FileTest.EXISTS)) continue;
+                try {
+                    await callAsync(Gio.file_new_for_path(path), 'delete_async',
+                        (f, res) => f.delete_finish(res), GLib.PRIORITY_LOW, null);
+                }
+                catch (e) {
+                    console.error(e);
+                }
             }
-            catch (e) {
-                console.error(e);
-            }
-        }
+        })().finally(() => this.#pendingDeletes.delete(id));
+        this.#pendingDeletes.set(id, job);
+        await job;
     }
 
     /**
