@@ -75,6 +75,26 @@ let SHOW_PIN_BUTTON           = true;
 let SHOW_EDIT_BUTTON          = true;
 let SHOW_PREVIEW_BUTTON       = true;
 
+/**
+ * Creates a colour for Clutter properties from components in [0, 1].
+ *
+ * GNOME 46 (Clutter 14) only accepts Clutter.Color; GNOME 47 removed
+ * Clutter.Color in favour of Cogl.Color.
+ */
+function makeColor (red, green, blue, alpha) {
+    if (Clutter.Color) {
+        return new Clutter.Color({
+            red: Math.round(red * 255),
+            green: Math.round(green * 255),
+            blue: Math.round(blue * 255),
+            alpha: Math.round(alpha * 255),
+        });
+    }
+    const color = new Cogl.Color();
+    color.init_from_4f(red, green, blue, alpha);
+    return color;
+}
+
 export default class ClipboardIndicatorExtension extends Extension {
     enable () {
         this.clipboardIndicator = new ClipboardIndicator({
@@ -2102,13 +2122,13 @@ const ClipboardIndicator = GObject.registerClass({
 
         });
 
-        const white = new Cogl.Color();
-        white.init_from_4f(1.0, 1.0, 1.0, 1.0);
-        const selectionBlue = new Cogl.Color();
-        selectionBlue.init_from_4f(0.39, 0.59, 1.0, 0.71);
-        clutterText.color = white;
-        clutterText.selection_color = selectionBlue;
-        clutterText.selected_text_color = white;
+        // Clutter.Text is not styled by the shell theme, so its colours are
+        // set here, following the shell's light or dark style.
+        const lightStyle = Main.getStyleVariant() === 'light';
+        const textColor = lightStyle ? makeColor(0.18, 0.18, 0.18, 1.0) : makeColor(1.0, 1.0, 1.0, 1.0);
+        clutterText.color = textColor;
+        clutterText.selection_color = makeColor(0.39, 0.59, 1.0, 0.71);
+        clutterText.selected_text_color = textColor;
 
         const textBox = new St.BoxLayout({
             style_class: 'ci-edit-textbox',
