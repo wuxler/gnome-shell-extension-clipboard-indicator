@@ -30,6 +30,7 @@ const MENU_BATCH_SIZE = 40;
 const PRUNE_DELAY_MS = 30 * 1000;
 // Give up on a clipboard owner that does not deliver its data in time.
 const CLIPBOARD_READ_TIMEOUT_MS = 5 * 1000;
+const CLIPBOARD_READ_TIMED_OUT = Symbol('clipboard read timed out');
 
 let DELAYED_SELECTION_TIMEOUT = 750;
 let MAX_REGISTRY_LENGTH       = 15;
@@ -93,11 +94,15 @@ export default class ClipboardIndicatorExtension extends Extension {
     }
 }
 
+// The GType name must differ from upstream's 'ClipboardIndicator': GTypes
+// cannot be unregistered, so if upstream was loaded earlier in the same
+// shell process, registering the same name again would fail.
 const ClipboardIndicator = GObject.registerClass({
-    GTypeName: 'ClipboardIndicator'
+    GTypeName: 'ClipboardIndicatorLazyFork'
 }, class ClipboardIndicator extends PanelMenu.Button {
     #refreshInProgress = false;
     #refreshPending = false;
+    #clipboardRequest = 0;
     #_imagePreviewOverlay = null;
 
     destroy () {
@@ -126,6 +131,9 @@ const ClipboardIndicator = GObject.registerClass({
         this.keyboard.destroy();
         this._cursorActor.destroy();
         this._cursorActor = null;
+
+        // The menu items are destroyed with the menu below.
+        this._menuItems.clear();
 
         super.destroy();
     }
@@ -254,7 +262,11 @@ const ClipboardIndicator = GObject.registerClass({
                 this._buttonText.set_text('');
                 this._buttonImgPreview.destroy_all_children();
                 this.registry.getEntryAsImage(entry).then(img => {
-                    if (!img || this._destroyed) return;
+                    if (!img) return;
+                    if (this._destroyed) {
+                        img.destroy();
+                        return;
+                    }
                     img.add_style_class_name('clipboard-indicator-img-preview');
                     img.y_align = Clutter.ActorAlign.CENTER;
 
@@ -285,7 +297,7 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     async _buildMenu () {
-        const clipHistory = await this._getCache();
+        const { entries: clipHistory, complete: historyComplete } = await this._getCache();
         if (this._destroyed) {
             return;
         }
@@ -479,11 +491,19 @@ const ClipboardIndicator = GObject.registerClass({
 
         this.#showElements();
 
-        this._pruneTimeoutId = setTimeout(() => {
-            this._pruneTimeoutId = null;
-            this.registry.pruneOrphanFiles(
-                id => this._history.some(e => e.isImage() && e.id() === id));
-        }, PRUNE_DELAY_MS);
+        // If the registry could not be loaded, the cached images may still
+        // belong to it (now in registry.txt~), so nothing is pruned.
+        if (historyComplete) {
+            this._pruneTimeoutId = setTimeout(() => {
+                this._pruneTimeoutId = null;
+                this.registry.pruneOrphanFiles(id => this.#isImageReferenced(id));
+            }, PRUNE_DELAY_MS);
+        }
+    }
+
+    /** @returns {boolean} whether an image with this id is in the history */
+    #isImageReferenced (id) {
+        return this._history.some(entry => entry.isImage() && entry.id() === id);
     }
 
     /**
@@ -700,8 +720,9 @@ const ClipboardIndicator = GObject.registerClass({
             }
             this.registry.getEntryAsImage(entry).then(img => {
                 if (!img) return;
-                // The item may have been removed while the thumbnail loaded.
-                if (this._menuItems.get(entry) !== menuItem) {
+                // The item may have been removed, or the whole indicator
+                // destroyed, while the thumbnail loaded.
+                if (this._destroyed || this._menuItems.get(entry) !== menuItem) {
                     img.destroy();
                     return;
                 }
@@ -1020,6 +1041,8 @@ const ClipboardIndicator = GObject.registerClass({
     _favoriteToggle (menuItem) {
         menuItem.entry.favorite = menuItem.entry.isFavorite() ? false : true;
         this._moveItemFirst(menuItem.entry);
+        // An unpinned image starts counting towards the image limits.
+        this._enforceImageQuota();
         this.#showElements();
     }
 
@@ -1111,7 +1134,7 @@ const ClipboardIndicator = GObject.registerClass({
         }
 
         if (entry.isImage() && event !== 'move') {
-            this.registry.deleteEntryFile(entry);
+            this.registry.deleteEntryFile(entry, id => this.#isImageReferenced(id));
         }
 
         if (!batch) {
@@ -1216,6 +1239,10 @@ const ClipboardIndicator = GObject.registerClass({
 
     async _onSelectionChange (selection, selectionType, selectionSource) {
         if (selectionType === Meta.SelectionType.SELECTION_CLIPBOARD) {
+            // A new owner makes pending image writes stale. Our own
+            // set_content() emits this synchronously, before it returns,
+            // so it never invalidates a request started after it.
+            this.#clipboardRequest++;
             this._refreshIndicator();
         }
     }
@@ -2149,6 +2176,7 @@ const ClipboardIndicator = GObject.registerClass({
     }
 
     #clearClipboard () {
+        this.#clipboardRequest++;
         this.extension.clipboard.set_text(CLIPBOARD_TYPE, "");
         this.#updateIndicatorContent(null);
     }
@@ -2160,10 +2188,19 @@ const ClipboardIndicator = GObject.registerClass({
      * @returns {Promise<boolean>} false if the image could not be read
      */
     async #updateClipboard (entry) {
+        // Reading a cached image is asynchronous. If anything else changes
+        // the clipboard meanwhile (another selection, an external copy, a
+        // clear), this request is stale and must not overwrite it.
+        const request = ++this.#clipboardRequest;
         try {
             if (entry.isImage() && !entry.hasBytes()) {
                 await this.registry.loadEntryBytes(entry);
-                if (this._destroyed) return false;
+                if (this._destroyed || request !== this.#clipboardRequest) {
+                    // Superseded: do not keep the image in memory. A newer
+                    // request for the same entry reads it again if needed.
+                    if (this.registry.hasEntryFile(entry)) entry.releaseBytes();
+                    return false;
+                }
             }
             this.extension.clipboard.set_content(CLIPBOARD_TYPE, entry.mimetype(), entry.asBytes());
             if (entry.isImage() && this.registry.hasEntryFile(entry)) entry.releaseBytes();
@@ -2175,6 +2212,48 @@ const ClipboardIndicator = GObject.registerClass({
         }
         this.#updateIndicatorContent(entry);
         return true;
+    }
+
+    /**
+     * Reads one mimetype from the clipboard.
+     *
+     * @param {string} type
+     * @returns {Promise<ClipboardEntry|null|symbol>} the entry, null if the
+     *   clipboard has no data of this type, or CLIPBOARD_READ_TIMED_OUT if
+     *   the owner did not deliver within CLIPBOARD_READ_TIMEOUT_MS
+     */
+    #readClipboard (type) {
+        return new Promise(resolve => {
+            // An owner that never answers (e.g. a frozen app) would
+            // otherwise stall every later clipboard refresh.
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+                settled = true;
+                console.warn(`Clipboard Indicator: reading ${type} from the clipboard timed out`);
+                resolve(CLIPBOARD_READ_TIMED_OUT);
+            }, CLIPBOARD_READ_TIMEOUT_MS);
+
+            this.extension.clipboard.get_content(CLIPBOARD_TYPE, type, (clipBoard, bytes) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+
+                // NOTE: `bytes` is freed when this callback returns; it must
+                // be copied (ClipboardEntry does) before any await.
+                if (bytes === null || bytes.get_size() === 0) {
+                    resolve(null);
+                    return;
+                }
+
+                // HACK: workaround for GNOME 2nd+ copy mangling mimetypes https://gitlab.gnome.org/GNOME/gnome-shell/-/issues/8233
+                // In theory GNOME or XWayland should auto-convert this back to UTF8_STRING for legacy apps when it's needed https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/5300
+                const mimetype = type === "UTF8_STRING" ? "text/plain;charset=utf-8" : type;
+
+                // New images are written to the cache by _refreshIndicator,
+                // only once they are known not to be duplicates.
+                resolve(new ClipboardEntry(mimetype, bytes, false));
+            });
+        });
     }
 
     async #getClipboardContent () {
@@ -2193,39 +2272,13 @@ const ClipboardIndicator = GObject.registerClass({
         ];
 
         for (let type of mimetypes) {
-            let result = await new Promise(resolve => {
-                // An owner that never answers (e.g. a frozen app) would
-                // otherwise stall every later clipboard refresh.
-                let settled = false;
-                const timeoutId = setTimeout(() => {
-                    settled = true;
-                    console.warn(`Clipboard Indicator: reading ${type} from the clipboard timed out`);
-                    resolve(null);
-                }, CLIPBOARD_READ_TIMEOUT_MS);
+            const result = await this.#readClipboard(type);
 
-                this.extension.clipboard.get_content(CLIPBOARD_TYPE, type, (clipBoard, bytes) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timeoutId);
-
-                // NOTE: `bytes` is freed when this callback returns; it must
-                // be copied (ClipboardEntry does) before any await.
-                if (bytes === null || bytes.get_size() === 0) {
-                    resolve(null);
-                    return;
-                }
-
-                // HACK: workaround for GNOME 2nd+ copy mangling mimetypes https://gitlab.gnome.org/GNOME/gnome-shell/-/issues/8233
-                // In theory GNOME or XWayland should auto-convert this back to UTF8_STRING for legacy apps when it's needed https://gitlab.gnome.org/GNOME/gtk/-/merge_requests/5300
-                if (type === "UTF8_STRING") {
-                    type = "text/plain;charset=utf-8";
-                }
-
-                // New images are written to the cache by _refreshIndicator,
-                // only once they are known not to be duplicates.
-                resolve(new ClipboardEntry(type, bytes, false));
-                });
-            });
+            // The owner did not answer: give up on this change entirely
+            // rather than waiting again for each remaining mimetype.
+            if (result === CLIPBOARD_READ_TIMED_OUT) {
+                return null;
+            }
 
             if (result) {
                 if (!CACHE_IMAGES && result.isImage()) {

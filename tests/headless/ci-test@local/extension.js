@@ -54,6 +54,34 @@ function makePng (w, h, rgba) {
     return new GLib.Bytes(buf);
 }
 
+// A PNG that does not compress well, so writing it takes a while.
+function makeNoisyPng (w, h, seed) {
+    const data = new Uint8Array(w * h * 3);
+    let x = seed >>> 0 || 1;
+    for (let i = 0; i < data.length; i++) {
+        x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+        data[i] = x & 0xff;
+    }
+    const pb = GdkPixbuf.Pixbuf.new_from_bytes(new GLib.Bytes(data),
+        GdkPixbuf.Colorspace.RGB, false, 8, w, h, w * 3);
+    const [, buf] = pb.save_to_bufferv('png', [], []);
+    return new GLib.Bytes(buf);
+}
+
+async function clipboardText () {
+    const data = await clipboardBytes('text/plain;charset=utf-8');
+    return data ? new TextDecoder().decode(data) : null;
+}
+
+function listDir (path) {
+    const names = [];
+    if (!GLib.file_test(path, GLib.FileTest.IS_DIR)) return names;
+    const en = Gio.File.new_for_path(path).enumerate_children('standard::name', 0, null);
+    let info;
+    while ((info = en.next_file(null)) !== null) names.push(info.get_name());
+    return names;
+}
+
 export default class CiTest extends Extension {
     enable () {
         // Disabling clipboard-indicator during the run makes GNOME re-enable
@@ -86,6 +114,48 @@ export default class CiTest extends Extension {
         log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` -- ${detail}` : ''}`);
     }
 
+    // CI_SCENARIO=corrupt (with a seed and CORRUPT=1): an unparsable
+    // registry must be kept as the backup and its images must survive.
+    async _runCorrupt () {
+        const loaded = await waitFor(() => this._ind()?._historyLoaded, 15000);
+        this._check('history loads despite a corrupt registry', loaded);
+        if (!loaded) return;
+        const ind = this._ind();
+        const images = () => listDir(ind.registry.REGISTRY_DIR).filter(n => /^\d+$/.test(n)).length;
+        const before = images();
+
+        this._check('corrupt registry starts an empty history', ind._history.length === 0);
+        this._check('corrupt registry is kept as backup',
+            GLib.file_test(ind.registry.BACKUP_REGISTRY_PATH, GLib.FileTest.EXISTS) &&
+            !GLib.file_test(ind.registry.REGISTRY_PATH, GLib.FileTest.EXISTS));
+        this._check('no pruning scheduled after a failed load', !ind._pruneTimeoutId);
+
+        await ind.registry.pruneOrphanFiles(() => false);
+        this._check('cached images survive a failed load', before > 0 && images() === before,
+            `images ${before} -> ${images()}`);
+    }
+
+    // CI_SCENARIO=gtype: upstream is enabled first, then replaced by this
+    // fork in the same shell process.
+    async _runGtype () {
+        const upstream = 'clipboard-indicator@tudmotu.com';
+        const up = await waitFor(() => this._ind() !== undefined, 15000);
+        this._check('upstream indicator loaded', up);
+
+        // disableExtension() only edits the enabled list; the extension is
+        // unloaded once the settings change arrives, which the keyfile
+        // backend delivers late. Wait for the upstream indicator to go.
+        await Main.extensionManager.disableExtension(upstream);
+        const gone = await waitFor(() => this._ind() === undefined, 10000);
+        this._check('upstream indicator removed', gone);
+        await Main.extensionManager.enableExtension(UUID);
+        const loaded = await waitFor(() => this._ind()?._historyLoaded, 10000);
+        const ext = Main.extensionManager.lookup(UUID);
+        this._check('fork loads after upstream in the same process',
+            loaded && ext?.state === 1 && !ext?.error,
+            `state=${ext?.state} error=${ext?.error}`);
+    }
+
     _ind () {
         return Main.panel.statusArea.clipboardIndicator;
     }
@@ -99,6 +169,10 @@ export default class CiTest extends Extension {
             log(`INFO prefs windows=${JSON.stringify(global.get_window_actors().map(a => a.meta_window.get_title()))}`);
             return;
         }
+
+        const scenario = GLib.getenv('CI_SCENARIO');
+        if (scenario === 'corrupt') return this._runCorrupt();
+        if (scenario === 'gtype') return this._runGtype();
 
         const seeded = GLib.getenv('CI_SEEDED') === '1';
 
@@ -272,11 +346,72 @@ export default class CiTest extends Extension {
         this._check('next/previous entry cycle', afterNext && afterNext !== before &&
             ind._selectedEntry === before);
 
+        // --- a slow image read must not override a later selection --------
+        {
+            const image = ind._history.find(e => e.isImage() && !e.hasBytes() && e !== ind._selectedEntry);
+            const text = ind._history.find(e => e.isText() && e.getStringValue() === 'ci text A');
+            if (!image || !text) {
+                log('INFO skipping selection race checks: no cached image to select');
+            } else {
+            ind._selectEntry(image);   // reads the image from disk
+            ind._selectEntry(text);    // set immediately
+            await sleep(1500);
+            const now = await clipboardText();
+            this._check('image read does not override a later text selection',
+                now === 'ci text A' && ind._selectedEntry === text, `clipboard=${JSON.stringify(now)}`);
+            this._check('superseded image read is released', !image.hasBytes());
+
+            ind._selectEntry(text);
+            ind._selectEntry(image);
+            await sleep(1500);
+            const data = await clipboardBytes(image.mimetype());
+            this._check('image selected after text wins',
+                data?.length === image.size() && ind._selectedEntry === image,
+                `clipboard=${data?.length} expected=${image.size()}`);
+            }
+        }
+
+        // --- an unresponsive clipboard owner costs one timeout -----------------
+        {
+            await sleep(1000);
+            const real = ind.extension.clipboard;
+            const asked = [];
+            ind.extension.clipboard = {
+                get_content: (type, mimetype, _cb) => asked.push(mimetype),  // never answers
+                set_content: (...args) => real.set_content(...args),
+                set_text: (...args) => real.set_text(...args),
+            };
+            const t0 = Date.now();
+            await ind._refreshIndicator();
+            const elapsed = Date.now() - t0;
+            ind.extension.clipboard = real;
+            this._check('clipboard read gives up after one timeout',
+                asked.length === 1 && elapsed < 7000, `requests=${asked.length} elapsed=${elapsed} ms`);
+        }
+
         // --- pin ---------------------------------------------------------------
         const textEntry = ind._history.find(e => e.isText() && !e.isFavorite() && e.getStringValue() === 'ci text B');
         ind._favoriteToggle(ind._menuItems.get(textEntry));
         this._check('pin moves entry to pinned section', textEntry.isFavorite() &&
             ind.favoritesSection._getMenuItems().includes(ind._menuItems.get(textEntry)));
+
+        // --- unpinning an image applies the image quota at once -------------
+        if (seeded) {
+            const pinnedImage = ind._history.find(e => e.isImage() && e.isFavorite());
+            const unpinned = () => ind._history.filter(e => e.isImage() && !e.isFavorite()).length;
+            const limit = unpinned();
+            settings.set_int('max-cached-images', limit);
+            await sleep(300);
+            ind._favoriteToggle(ind._menuItems.get(pinnedImage));
+            await sleep(300);
+            this._check('unpinning an image enforces the image quota',
+                !pinnedImage.isFavorite() && unpinned() === limit, `unpinned=${unpinned()} limit=${limit}`);
+            settings.set_int('max-cached-images', 50);
+            await sleep(300);
+
+            // Keep one image pinned for the teardown check at the end.
+            ind._favoriteToggle(ind._menuItems.get(pinnedImage));
+        }
 
         // --- delete image --------------------------------------------------
         if (gotImage) {
@@ -287,6 +422,34 @@ export default class CiTest extends Extension {
             this._check('deleting image removes file and thumbnail',
                 !ind._history.includes(img) && !ind._menuItems.has(img) &&
                 !GLib.file_test(file, GLib.FileTest.EXISTS) && !GLib.file_test(thumb, GLib.FileTest.EXISTS));
+        }
+
+        // --- deleting an image while it is still being written ---------------
+        {
+            const big = makeNoisyPng(1600, 1200, 7);
+            const id = String(big.hash());
+            const origAdd = ind._addEntry.bind(ind);
+            let deletedWhilePending = null;
+            ind._addEntry = (entry, ...rest) => {
+                origAdd(entry, ...rest);
+                // Delete right after it is added, while its write is pending.
+                if (entry.isImage() && entry.id() === id) {
+                    Promise.resolve().then(() => {
+                        deletedWhilePending = !ind.registry.hasEntryFile(entry);
+                        ind._removeEntry(entry, 'delete');
+                    });
+                }
+            };
+            clipboard.set_content(CLIP, 'image/png', big);
+            await waitFor(() => deletedWhilePending !== null, 5000);
+            await sleep(3000);
+            ind._addEntry = origAdd;
+            const leftovers = listDir(ind.registry.REGISTRY_DIR).concat(listDir(ind.registry.THUMBNAIL_DIR))
+                .filter(n => n.startsWith(id));
+            this._check('image deleted during its write leaves no files',
+                deletedWhilePending === true &&
+                !ind._history.some(e => e.isImage() && e.id() === id) && leftovers.length === 0,
+                `deletedWhilePending=${deletedWhilePending} leftovers=${JSON.stringify(leftovers)}`);
         }
 
         // --- cancel (undo last copy) -----------------------------------------
@@ -307,6 +470,94 @@ export default class CiTest extends Extension {
             referenced.every(p => GLib.file_test(p, GLib.FileTest.EXISTS)),
             `referenced=${referenced.length}`);
 
+        // --- prune leaves temporaries and backup-referenced images alone ----
+        {
+            const dir = ind.registry.REGISTRY_DIR;
+            const temp = `${dir}/.goutputstream-CITEST`;
+            const other = `${dir}/notes.txt`;
+            const backedUp = `${dir}/987654321`;
+            const orphan = `${dir}/123123123`;
+            const stalePartial = `${dir}/555555555.partial`;
+            for (const p of [temp, other, backedUp, orphan, stalePartial]) GLib.file_set_contents(p, 'x');
+            GLib.file_set_contents(ind.registry.BACKUP_REGISTRY_PATH, JSON.stringify([
+                { favorite: false, mimetype: 'image/png', contents: '/elsewhere/987654321' },
+            ]));
+            await ind.registry.pruneOrphanFiles(id => ind._history.some(e => e.isImage() && e.id() === id));
+            const exists = p => GLib.file_test(p, GLib.FileTest.EXISTS);
+            this._check('prune keeps temporaries, foreign files and backup images',
+                exists(temp) && exists(other) && exists(backedUp) && !exists(orphan) && !exists(stalePartial),
+                `temp=${exists(temp)} other=${exists(other)} backedUp=${exists(backedUp)} ` +
+                `orphan=${exists(orphan)} stalePartial=${exists(stalePartial)}`);
+
+            GLib.file_set_contents(ind.registry.BACKUP_REGISTRY_PATH, '[not json');
+            GLib.file_set_contents(orphan, 'x');
+            await ind.registry.pruneOrphanFiles(() => false);
+            this._check('prune does nothing while the backup is unreadable', exists(orphan) && exists(backedUp));
+
+            for (const p of [temp, other, backedUp, orphan, stalePartial, ind.registry.BACKUP_REGISTRY_PATH])
+                GLib.unlink(p);
+        }
+
+        // --- registry edge cases, on a separate scratch registry ------------
+        {
+            const mod = await import(`file://${Main.extensionManager.lookup(UUID).path}/registry.js`);
+            const reg = new mod.Registry({ settings, uuid: 'ci-registry-test' });
+            const dir = reg.REGISTRY_DIR;
+            GLib.mkdir_with_parents(dir, 0o755);
+            const exists = p => GLib.file_test(p, GLib.FileTest.EXISTS);
+            const write = (name, text) => GLib.file_set_contents(`${dir}/${name}`, text);
+
+            // A record that fails to convert makes the load incomplete and
+            // keeps the original registry as the backup.
+            write('111', 'x');
+            write('222', 'x');
+            const original = JSON.stringify([
+                { favorite: false, mimetype: 'image/png', contents: `${dir}/111` },
+                { favorite: false, mimetype: 1, contents: `${dir}/222` },
+            ]);
+            write('registry.txt', original);
+            // run.sh does not count extension errors logged between these markers.
+            log('EXPECTED-ERRORS-BEGIN');
+            const { entries, complete } = await reg.read();
+            log('EXPECTED-ERRORS-END');
+            const [, backup] = GLib.file_get_contents(reg.BACKUP_REGISTRY_PATH);
+            this._check('malformed record makes the load incomplete and is backed up',
+                !complete && entries.length === 1 && new TextDecoder().decode(backup) === original,
+                `complete=${complete} entries=${entries.length}`);
+            await reg.pruneOrphanFiles(id => id === '111');
+            this._check('image of a malformed record survives pruning', exists(`${dir}/222`));
+
+            // A backup that is not an array disables pruning.
+            write('registry.txt~', '"just a string"');
+            write('333', 'x');
+            await reg.pruneOrphanFiles(() => false);
+            this._check('non-array backup disables pruning', exists(`${dir}/333`));
+
+            // A backup over the cache-size limit is not parsed.
+            const limit = settings.get_int('cache-size');
+            settings.set_int('cache-size', 1);
+            write('registry.txt~', JSON.stringify([{ mimetype: 'text/plain', contents: 'y'.repeat(1100 * 1024) }]));
+            write('444', 'x');
+            await reg.pruneOrphanFiles(() => false);
+            settings.set_int('cache-size', limit);
+            this._check('oversized backup disables pruning', exists(`${dir}/444`));
+
+            // Copying an image again while its files are being deleted must
+            // leave a complete, usable file.
+            const png = makePng(300, 200, 0x55aa33ff);
+            const first = new mod.ClipboardEntry('image/png', png, false);
+            await reg.writeEntryFile(first);
+            const deletion = reg.deleteEntryFile(first, () => false);
+            const again = new mod.ClipboardEntry('image/png', png, false);
+            const rewrite = reg.writeEntryFile(again);
+            await Promise.all([deletion, rewrite]);
+            this._check('recopy during deletion keeps the image file',
+                exists(reg.getEntryFilename(again)) && reg.hasEntryFile(again));
+
+            reg.clearCacheFolder();
+            Gio.File.new_for_path(dir).delete(null);
+        }
+
         // --- clear history keeps pins --------------------------------------
         ind._clearHistory();
         await sleep(500);
@@ -321,6 +572,17 @@ export default class CiTest extends Extension {
         this._check('registry matches history', reg.length === ind._history.length &&
             reg.filter(r => r.mimetype.startsWith('image/')).every(r => r.id && typeof r.size === 'number'),
             `registry=${reg.length} history=${ind._history.length}`);
+
+        // --- disabling while thumbnails are being made ----------------------
+        // Delete the thumbnails and force the labels to be rebuilt, then
+        // disable at once. run.sh fails the run on any "already disposed"
+        // error logged by the late thumbnail callbacks.
+        if (seeded) {
+            for (const e of ind._history.filter(e => e.isImage()))
+                GLib.unlink(ind.registry.getThumbnailFilename(e));
+            settings.set_int('preview-size', settings.get_int('preview-size') + 1);
+            log(`INFO disabling with ${ind._history.filter(e => e.isImage()).length} thumbnails pending`);
+        }
 
         // --- disable / enable round trip ---------------------------------------
         const expected = ind._history.map(e => e.getStringValue());
