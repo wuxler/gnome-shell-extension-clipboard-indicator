@@ -6,3 +6,4 @@
 tests/headless/runs/
 tests/headless/build/
 tests/headless/seed-*/
+tests/headless/upstream-*/
