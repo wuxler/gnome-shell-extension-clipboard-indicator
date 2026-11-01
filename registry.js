@@ -1,13 +1,76 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import GdkPixbuf from 'gi://GdkPixbuf';
 import St from 'gi://St';
 import { PrefsFields } from './constants.js';
 
-const FileQueryInfoFlags = Gio.FileQueryInfoFlags;
 const FileCopyFlags = Gio.FileCopyFlags;
 const FileTest = GLib.FileTest;
 
+/** Longest side of generated thumbnails, in pixels. */
+const THUMBNAIL_SIZE = 128;
+const THUMBNAIL_DIR = 'thumbnails';
+/**
+ * Thumbnails decoded at the same time. The first menu open after upgrading
+ * may need thumbnails for every cached image; decoding them all at once
+ * would saturate the CPU.
+ */
+const MAX_CONCURRENT_THUMBNAILS = 2;
+
+/**
+ * Promise wrapper for a Gio-style `*_async` / `*_finish` pair.
+ *
+ * Extensions cannot rely on which Gio methods GNOME Shell has promisified,
+ * so the callbacks are wrapped explicitly.
+ */
+function callAsync (obj, method, finish, ...args) {
+    return new Promise((resolve, reject) => {
+        obj[method](...args, (source, res) => {
+            try {
+                resolve(finish(source, res));
+            }
+            catch (e) {
+                reject(e);
+            }
+        });
+    });
+}
+
+function loadFileContents (file) {
+    return callAsync(file, 'load_contents_async',
+        (f, res) => f.load_contents_finish(res)[1], null);
+}
+
+async function writeFileContents (file, bytes) {
+    const stream = await callAsync(file, 'replace_async',
+        (f, res) => f.replace_finish(res),
+        null, false, Gio.FileCreateFlags.NONE, GLib.PRIORITY_LOW, null);
+    await callAsync(stream, 'write_bytes_async',
+        (s, res) => s.write_bytes_finish(res),
+        bytes, GLib.PRIORITY_LOW, null);
+    await callAsync(stream, 'close_async',
+        (s, res) => s.close_finish(res),
+        GLib.PRIORITY_LOW, null);
+}
+
+/**
+ * Stores clipboard history on disk.
+ *
+ * Layout of the cache directory (`$XDG_CACHE_HOME/<uuid>/`):
+ * - `registry.txt`: JSON array of entries, oldest first. Text entries hold
+ *   their contents inline; image entries reference a file in this directory.
+ * - `<id>`: one file per cached image, named after the image id.
+ * - `thumbnails/<id>.png`: downscaled previews used by the menu.
+ *
+ * Reading the registry never loads image data, so its cost does not grow
+ * with the size of the cached images.
+ */
 export class Registry {
+    #pendingThumbnails = new Map();
+    #pendingWrites = new Map();
+    #thumbnailQueue = [];
+    #runningThumbnails = 0;
+
     constructor ({ settings, uuid }) {
         this.uuid = uuid;
         this.settings = settings;
@@ -15,6 +78,7 @@ export class Registry {
         this.REGISTRY_DIR = GLib.get_user_cache_dir() + '/' + this.uuid;
         this.REGISTRY_PATH = this.REGISTRY_DIR + '/' + this.REGISTRY_FILE;
         this.BACKUP_REGISTRY_PATH = this.REGISTRY_PATH + '~';
+        this.THUMBNAIL_DIR = this.REGISTRY_DIR + '/' + THUMBNAIL_DIR;
     }
 
     write (entries) {
@@ -32,9 +96,10 @@ export class Registry {
                 item.contents = entry.getStringValue();
             }
             else if (entry.isImage()) {
-                const filename = this.getEntryFilename(entry);
-                item.contents = filename;
-                this.writeEntryFile(entry);
+                item.contents = this.getEntryFilename(entry);
+                item.id = entry.id();
+                item.size = entry.size();
+                if (entry.hasBytes()) this.writeEntryFile(entry);
             }
 
             if (entry.getTag()) item.tag = entry.getTag();
@@ -44,117 +109,112 @@ export class Registry {
     }
 
     writeToFile (registry) {
-        let json = JSON.stringify(registry);
-        let contents = new GLib.Bytes(json);
+        const contents = new GLib.Bytes(JSON.stringify(registry));
 
-        // Make sure dir exists
         GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
 
-        // Write contents to file asynchronously
-        let file = Gio.file_new_for_path(this.REGISTRY_PATH);
-        file.replace_async(null, false, Gio.FileCreateFlags.NONE,
-                            GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-
-            let stream = obj.replace_finish(res);
-
-            stream.write_bytes_async(contents, GLib.PRIORITY_DEFAULT,
-                                null, (w_obj, w_res) => {
-
-                w_obj.write_bytes_finish(w_res);
-                stream.close(null);
-            });
+        const file = Gio.file_new_for_path(this.REGISTRY_PATH);
+        writeFileContents(file, contents).catch(e => {
+            console.error('Clipboard Indicator: failed to write registry');
+            console.error(e);
         });
     }
 
+    /**
+     * Reads the history from disk.
+     *
+     * Only metadata is read for image entries; their bytes stay on disk until
+     * an entry is actually put on the clipboard. Entries whose image file is
+     * missing are dropped.
+     *
+     * @returns {Promise<ClipboardEntry[]>} entries, oldest first
+     */
     async read () {
-        return new Promise(resolve => {
-            if (GLib.file_test(this.REGISTRY_PATH, FileTest.EXISTS)) {
-                let file = Gio.file_new_for_path(this.REGISTRY_PATH);
-                let CACHE_FILE_SIZE = this.settings.get_int(PrefsFields.CACHE_FILE_SIZE);
+        if (!GLib.file_test(this.REGISTRY_PATH, FileTest.EXISTS)) return [];
 
-                file.query_info_async('*', FileQueryInfoFlags.NONE,
-                                      GLib.PRIORITY_DEFAULT, null, (src, res) => {
-                    // Check if file size is larger than CACHE_FILE_SIZE
-                    // If so, make a backup of file, and resolve with empty array
-                    let file_info = src.query_info_finish(res);
+        const file = Gio.file_new_for_path(this.REGISTRY_PATH);
+        const maxRegistryBytes = this.settings.get_int(PrefsFields.CACHE_FILE_SIZE) * 1024 * 1024;
 
-                    if (file_info.get_size() >= CACHE_FILE_SIZE * 1024 * 1024) {
-                        let destination = Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH);
+        try {
+            const info = await callAsync(file, 'query_info_async',
+                (f, res) => f.query_info_finish(res),
+                'standard::size', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null);
 
-                        file.move(destination, FileCopyFlags.OVERWRITE, null, null);
-                        resolve([]);
-                        return;
-                    }
-
-                    file.load_contents_async(null, (obj, res) => {
-                        let [success, contents] = obj.load_contents_finish(res);
-
-                        if (success) {
-                            let max_size = this.settings.get_int(PrefsFields.HISTORY_SIZE);
-                            const cacheTextData = new TextDecoder().decode(contents);
-                            let registry;
-                            if (cacheTextData.trim().length == 0) {
-                                registry = [];
-                            } else {
-                                registry = JSON.parse(cacheTextData);
-                            }
-                            const entriesPromises = registry.map(
-                                jsonEntry => {
-                                    return ClipboardEntry.fromJSON(jsonEntry)
-                                }
-                            );
-
-                            Promise.all(entriesPromises).then(clipboardEntries => {
-                                clipboardEntries = clipboardEntries
-                                    .filter(entry => entry !== null);
-
-                                let registryNoFavorite = clipboardEntries
-                                    .filter(entry => !entry.isFavorite());
-
-                                while (registryNoFavorite.length > max_size) {
-                                    let oldestNoFavorite = registryNoFavorite.shift();
-                                    let itemIdx = clipboardEntries.indexOf(oldestNoFavorite);
-                                    clipboardEntries.splice(itemIdx,1);
-
-                                    registryNoFavorite = clipboardEntries.filter(
-                                        entry => !entry.isFavorite()
-                                    );
-                                }
-
-                                resolve(clipboardEntries);
-                            }).catch(e => {
-                                console.error(e);
-                            });
-                        }
-                        else {
-                            console.error('Clipboard Indicator: failed to open registry file');
-                        }
-                    });
-                });
+            // An oversized registry is moved aside instead of being parsed.
+            if (info.get_size() >= maxRegistryBytes) {
+                file.move(Gio.file_new_for_path(this.BACKUP_REGISTRY_PATH),
+                    FileCopyFlags.OVERWRITE, null, null);
+                return [];
             }
-            else {
-                resolve([]);
-            }
-        });
+
+            const contents = await loadFileContents(file);
+            const text = new TextDecoder().decode(contents);
+            const registry = text.trim().length === 0 ? [] : JSON.parse(text);
+
+            return registry
+                .map(jsonEntry => ClipboardEntry.fromJSON(jsonEntry, this.REGISTRY_DIR))
+                .filter(entry => entry !== null);
+        }
+        catch (e) {
+            console.error('Clipboard Indicator: failed to read registry');
+            console.error(e);
+            return [];
+        }
+    }
+
+    getEntryFilename (entry) {
+        return `${this.REGISTRY_DIR}/${entry.id()}`;
+    }
+
+    getThumbnailFilename (entry) {
+        return `${this.THUMBNAIL_DIR}/${entry.id()}.png`;
     }
 
     #entryFileExists (entry) {
-        const filename = this.getEntryFilename(entry);
-        return GLib.file_test(filename, FileTest.EXISTS);
+        return GLib.file_test(this.getEntryFilename(entry), FileTest.EXISTS);
     }
 
-    async getEntryAsImage (entry) {
-        if (entry.isImage() === false) return;
+    /**
+     * Makes sure the entry's bytes are in memory, reading the cached image
+     * file if needed.
+     *
+     * @param {ClipboardEntry} entry
+     */
+    async loadEntryBytes (entry) {
+        if (entry.hasBytes()) return;
 
-        if (this.#entryFileExists(entry) == false) {
-            await this.writeEntryFile(entry);
+        const contents = await loadFileContents(
+            Gio.file_new_for_path(this.getEntryFilename(entry)));
+        entry.setBytes(contents);
+    }
+
+    /** @returns {boolean} whether the entry's thumbnail is already on disk */
+    hasThumbnail (entry) {
+        return GLib.file_test(this.getThumbnailFilename(entry), FileTest.EXISTS);
+    }
+
+    /**
+     * @returns {Promise<St.Icon|null>} a small preview icon for an image entry.
+     *   Falls back to a generic image icon if no thumbnail can be made.
+     */
+    async getEntryAsImage (entry) {
+        if (entry.isImage() === false) return null;
+
+        let gicon;
+        try {
+            const path = await this.ensureThumbnail(entry);
+            gicon = Gio.FileIcon.new(Gio.file_new_for_path(path));
+        }
+        catch (e) {
+            console.error(`Clipboard Indicator: no thumbnail for image ${entry.id()}`);
+            console.error(e);
+            gicon = Gio.ThemedIcon.new('image-x-generic-symbolic');
         }
 
-        const gicon = Gio.icon_new_for_string(this.getEntryFilename(entry));
-        const stIcon = new St.Icon({ gicon });
-        return stIcon;
+        return new St.Icon({ gicon });
     }
 
+    /** @returns {Promise<Clutter.Actor|null>} the full-size image, loaded off the main thread. */
     async getEntryAsTexture (entry) {
         if (entry.isImage() === false) return null;
 
@@ -167,55 +227,179 @@ export class Registry {
         return St.TextureCache.get_default().load_file_async(file, -1, -1, scaleFactor, 1.0);
     }
 
-    getEntryFilename (entry) {
-        return `${this.REGISTRY_DIR}/${entry.asBytes().hash()}`;
+    /**
+     * Creates the thumbnail for an image entry unless it already exists.
+     *
+     * Decoding runs in a GdkPixbuf worker thread. Concurrent calls for the
+     * same entry share one job.
+     *
+     * @returns {Promise<string>} path of the thumbnail
+     */
+    ensureThumbnail (entry) {
+        const path = this.getThumbnailFilename(entry);
+        if (GLib.file_test(path, FileTest.EXISTS)) return Promise.resolve(path);
+
+        const id = entry.id();
+        if (this.#pendingThumbnails.has(id)) return this.#pendingThumbnails.get(id);
+
+        const job = this.#throttled(() => this.#createThumbnail(entry, path))
+            .finally(() => this.#pendingThumbnails.delete(id));
+        this.#pendingThumbnails.set(id, job);
+        return job;
     }
 
-    async writeEntryFile (entry) {
-        if (this.#entryFileExists(entry)) return;
-
-        let file = Gio.file_new_for_path(this.getEntryFilename(entry));
-
-        return new Promise(resolve => {
-            file.replace_async(null, false, Gio.FileCreateFlags.NONE,
-                               GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-
-                let stream = obj.replace_finish(res);
-
-                stream.write_bytes_async(entry.asBytes(), GLib.PRIORITY_DEFAULT,
-                                         null, (w_obj, w_res) => {
-
-                    w_obj.write_bytes_finish(w_res);
-                    stream.close(null);
-                    resolve();
-                });
-            });
+    /** Runs `task` once fewer than MAX_CONCURRENT_THUMBNAILS are running. */
+    #throttled (task) {
+        return new Promise((resolve, reject) => {
+            this.#thumbnailQueue.push({ task, resolve, reject });
+            this.#drainThumbnailQueue();
         });
     }
 
+    #drainThumbnailQueue () {
+        while (this.#runningThumbnails < MAX_CONCURRENT_THUMBNAILS && this.#thumbnailQueue.length > 0) {
+            const { task, resolve, reject } = this.#thumbnailQueue.shift();
+            this.#runningThumbnails++;
+            task().then(resolve, reject).finally(() => {
+                this.#runningThumbnails--;
+                this.#drainThumbnailQueue();
+            });
+        }
+    }
+
+    async #createThumbnail (entry, path) {
+        let stream;
+        if (entry.hasBytes()) {
+            stream = Gio.MemoryInputStream.new_from_bytes(entry.asBytes());
+        }
+        else {
+            const file = Gio.file_new_for_path(this.getEntryFilename(entry));
+            stream = await callAsync(file, 'read_async',
+                (f, res) => f.read_finish(res), GLib.PRIORITY_LOW, null);
+        }
+
+        const pixbuf = await callAsync(GdkPixbuf.Pixbuf, 'new_from_stream_at_scale_async',
+            (_s, res) => GdkPixbuf.Pixbuf.new_from_stream_finish(res),
+            stream, THUMBNAIL_SIZE, THUMBNAIL_SIZE, true, null);
+        stream.close(null);
+
+        GLib.mkdir_with_parents(this.THUMBNAIL_DIR, parseInt('0775', 8));
+
+        // Encode to memory first, then write atomically through replace_async,
+        // so a half-written thumbnail is never picked up.
+        const [ok, buffer] = pixbuf.save_to_bufferv('png', [], []);
+        if (!ok) throw new Error('could not encode thumbnail');
+        await writeFileContents(Gio.file_new_for_path(path), new GLib.Bytes(buffer));
+        return path;
+    }
+
+    /** @returns {boolean} whether the entry's image is persisted on disk */
+    hasEntryFile (entry) {
+        return this.#entryFileExists(entry);
+    }
+
+    /**
+     * Persists an image entry's bytes. Concurrent calls for the same entry
+     * share one write.
+     */
+    writeEntryFile (entry) {
+        if (this.#entryFileExists(entry) || !entry.hasBytes()) return Promise.resolve();
+
+        const id = entry.id();
+        if (this.#pendingWrites.has(id)) return this.#pendingWrites.get(id);
+
+        GLib.mkdir_with_parents(this.REGISTRY_DIR, parseInt('0775', 8));
+        const job = writeFileContents(
+            Gio.file_new_for_path(this.getEntryFilename(entry)), entry.asBytes())
+            .catch(e => {
+                console.error('Clipboard Indicator: failed to cache image');
+                console.error(e);
+            })
+            .finally(() => this.#pendingWrites.delete(id));
+        this.#pendingWrites.set(id, job);
+        return job;
+    }
+
     async deleteEntryFile (entry) {
-        const file = Gio.file_new_for_path(this.getEntryFilename(entry));
+        for (const path of [this.getEntryFilename(entry), this.getThumbnailFilename(entry)]) {
+            if (!GLib.file_test(path, FileTest.EXISTS)) continue;
+            try {
+                await callAsync(Gio.file_new_for_path(path), 'delete_async',
+                    (f, res) => f.delete_finish(res), GLib.PRIORITY_LOW, null);
+            }
+            catch (e) {
+                console.error(e);
+            }
+        }
+    }
+
+    /**
+     * Deletes cached image files and thumbnails that no entry references,
+     * e.g. left behind by an interrupted write or an older version.
+     *
+     * @param {function(string): boolean} isReferenced called for each file
+     *   with its image id. It is evaluated per file rather than on a snapshot,
+     *   so images copied while the scan runs are not deleted.
+     */
+    async pruneOrphanFiles (isReferenced) {
+        const keep = new Set([this.REGISTRY_FILE, this.REGISTRY_FILE + '~', THUMBNAIL_DIR]);
+
+        const prune = async (dir, idOf) => {
+            const folder = Gio.file_new_for_path(dir);
+            if (!GLib.file_test(dir, FileTest.IS_DIR)) return;
+
+            const enumerator = await callAsync(folder, 'enumerate_children_async',
+                (f, res) => f.enumerate_children_finish(res),
+                'standard::name', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                GLib.PRIORITY_LOW, null);
+
+            for (;;) {
+                const infos = await callAsync(enumerator, 'next_files_async',
+                    (en, res) => en.next_files_finish(res), 64, GLib.PRIORITY_LOW, null);
+                if (infos.length === 0) break;
+
+                for (const info of infos) {
+                    const name = info.get_name();
+                    if (keep.has(name) || isReferenced(idOf(name))) continue;
+                    try {
+                        await callAsync(folder.get_child(name), 'delete_async',
+                            (f, res) => f.delete_finish(res), GLib.PRIORITY_LOW, null);
+                    }
+                    catch (e) {
+                        console.error(e);
+                    }
+                }
+            }
+            enumerator.close(null);
+        };
 
         try {
-            await file.delete_async(GLib.PRIORITY_DEFAULT, null);
+            await prune(this.REGISTRY_DIR, name => name);
+            await prune(this.THUMBNAIL_DIR, name => name.replace(/\.png$/, ''));
         }
         catch (e) {
+            console.error('Clipboard Indicator: failed to prune cache');
             console.error(e);
         }
     }
 
     clearCacheFolder() {
-
         const CANCELLABLE = null;
-        try {
-            const folder = Gio.file_new_for_path(this.REGISTRY_DIR);
-            const enumerator = folder.enumerate_children("", 1, CANCELLABLE);
+        const clear = path => {
+            const folder = Gio.file_new_for_path(path);
+            const enumerator = folder.enumerate_children('standard::name,standard::type',
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, CANCELLABLE);
 
-            let file;
-            while ((file = enumerator.iterate(CANCELLABLE)[2]) != null) {
-                file.delete(CANCELLABLE);
+            let info;
+            while ((info = enumerator.next_file(CANCELLABLE)) !== null) {
+                const child = folder.get_child(info.get_name());
+                if (info.get_file_type() === Gio.FileType.DIRECTORY) clear(child.get_path());
+                child.delete(CANCELLABLE);
             }
+        };
 
+        try {
+            if (GLib.file_test(this.REGISTRY_DIR, FileTest.IS_DIR)) clear(this.REGISTRY_DIR);
         }
         catch (e) {
             console.error(e);
@@ -223,14 +407,22 @@ export class Registry {
     }
 }
 
+/**
+ * One clipboard history item.
+ *
+ * Text entries keep their contents in memory. Image entries are identified
+ * by `id()` (the decimal `GLib.Bytes.hash()` of the image, which is also the
+ * cache file name) and hold their bytes only transiently: right after being
+ * copied, or while being put back on the clipboard. Call
+ * `Registry.loadEntryBytes()` before `asBytes()` on an image entry.
+ */
 export class ClipboardEntry {
     #mimetype;
     #bytes;
     #favorite;
-
-    static #decode (contents) {
-        return Uint8Array.from(contents.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
-    }
+    #id = null;
+    #size = 0;
+    #tag = null;
 
     static __isText (mimetype) {
         return mimetype.startsWith('text/') ||
@@ -238,72 +430,100 @@ export class ClipboardEntry {
             mimetype === 'UTF8_STRING';
     }
 
-    static async fromJSON (jsonEntry) {
+    /**
+     * @param {object} jsonEntry one element of registry.txt
+     * @param {string} registryDir directory holding the cached image files
+     * @returns {ClipboardEntry|null} null if the entry's image file is gone
+     */
+    static fromJSON (jsonEntry, registryDir) {
         const mimetype = jsonEntry.mimetype || 'text/plain;charset=utf-8';
-        const favorite = jsonEntry.favorite;
-        let bytes;
+        const favorite = !!jsonEntry.favorite;
+        let entry;
 
         if (ClipboardEntry.__isText(mimetype)) {
-            bytes = new TextEncoder().encode(jsonEntry.contents);
+            entry = new ClipboardEntry(mimetype, new TextEncoder().encode(jsonEntry.contents), favorite);
         }
         else {
-            const filename = jsonEntry.contents;
-            if (!GLib.file_test(filename, FileTest.EXISTS)) return null;
+            // Registries written by upstream versions only have `contents`,
+            // an absolute path whose basename is the image hash. Resolve it
+            // against the current directory so a moved cache still works.
+            const id = jsonEntry.id ?? GLib.path_get_basename(jsonEntry.contents ?? '');
+            const path = `${registryDir}/${id}`;
+            if (!id || !GLib.file_test(path, FileTest.EXISTS)) return null;
 
-            let file = Gio.file_new_for_path(filename);
-
-            const contentType = await file.query_info_async('*', FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-                try {
-                    const fileInfo = obj.query_info_finish(res);
-                    return fileInfo.get_content_type();
-                } catch (e) {
-                    console.error(e);
-                }
-            });
-
-            if (contentType && !contentType.startsWith('image/') && !contentType.startsWith('text/')) {
-                bytes = new TextEncoder().encode(jsonEntry.contents);
+            let size = jsonEntry.size;
+            if (typeof size !== 'number') {
+                // Older registries have no size; a stat is cheap compared to reading the file.
+                size = Gio.file_new_for_path(path)
+                    .query_info('standard::size', Gio.FileQueryInfoFlags.NONE, null)
+                    .get_size();
             }
-            else {
-                bytes = await new Promise((resolve, reject) => file.load_contents_async(null, (obj, res) => {
-                    let [success, contents] = obj.load_contents_finish(res);
 
-                    if (success) {
-                        resolve(contents);
-                    }
-                    else {
-                        reject(
-                            new Error('Clipboard Indicator: could not read image file from cache')
-                        );
-                    }
-                }));
-            }
+            entry = ClipboardEntry.forImage(mimetype, String(id), size, favorite);
         }
 
-        const entry = new ClipboardEntry(mimetype, bytes, favorite);
         if (jsonEntry.tag) entry.setTag(jsonEntry.tag);
         return entry;
     }
 
-    constructor (mimetype, bytes, favorite) {
-        this.#mimetype = mimetype;
-        this.#bytes = bytes;
-        this.#favorite = favorite;
+    /** Creates an image entry whose bytes are still on disk. */
+    static forImage (mimetype, id, size, favorite) {
+        const entry = new ClipboardEntry(mimetype, null, favorite);
+        entry.#id = id;
+        entry.#size = size;
+        return entry;
     }
 
-    #encode () {
-        if (this.isText()) {
-            return this.getStringValue();
-        }
+    /**
+     * @param {string} mimetype
+     * @param {Uint8Array|null} bytes
+     * @param {boolean} favorite
+     */
+    constructor (mimetype, bytes, favorite) {
+        this.#mimetype = mimetype;
+        this.#favorite = !!favorite;
+        if (bytes) this.setBytes(bytes);
+    }
 
-        return [...this.#bytes]
-            .map(x => x.toString(16).padStart(2, '0'))
-            .join('');
+    /**
+     * Identifier of an image entry, stable across sessions. Matches the
+     * `GLib.Bytes.hash()` based file names used by upstream versions.
+     */
+    id () {
+        return this.#id;
+    }
+
+    /** Size of the entry's data in bytes. */
+    size () {
+        return this.#size;
+    }
+
+    hasBytes () {
+        return this.#bytes !== null && this.#bytes !== undefined;
+    }
+
+    /** @param {GLib.Bytes|Uint8Array} bytes */
+    setBytes (bytes) {
+        let hash = null;
+        if (bytes instanceof GLib.Bytes) {
+            if (this.isImage() && this.#id === null) hash = bytes.hash();
+            bytes = bytes.get_data() ?? new Uint8Array();
+        }
+        this.#bytes = bytes;
+        this.#size = bytes.length;
+        if (this.isImage() && this.#id === null) {
+            this.#id = String(hash ?? GLib.Bytes.new(bytes).hash());
+        }
+    }
+
+    /** Drops the in-memory copy of an image; it can be reloaded from disk. */
+    releaseBytes () {
+        if (this.isImage()) this.#bytes = null;
     }
 
     getStringValue () {
         if (this.isImage()) {
-            return `[Image ${this.asBytes().hash()}]`;
+            return `[Image ${this.#id}]`;
         }
         return new TextDecoder().decode(this.#bytes);
     }
@@ -330,10 +550,8 @@ export class ClipboardEntry {
 
     setText (text) {
         if (!this.isText()) return;
-        this.#bytes = new TextEncoder().encode(text);
+        this.setBytes(new TextEncoder().encode(text));
     }
-
-    #tag = null;
 
     getTag () {
         return this.#tag;
@@ -344,11 +562,13 @@ export class ClipboardEntry {
     }
 
     asBytes () {
+        if (!this.hasBytes()) {
+            throw new Error(`Clipboard Indicator: bytes of image ${this.#id} are not loaded`);
+        }
         return GLib.Bytes.new(this.#bytes);
     }
 
     equals (otherEntry) {
         return this.getStringValue() === otherEntry.getStringValue();
-        // this.asBytes().equal(otherEntry.asBytes());
     }
 }
