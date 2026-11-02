@@ -1,5 +1,6 @@
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
+import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
@@ -101,7 +102,8 @@ export default class ClipboardIndicatorExtension extends Extension {
             clipboard: St.Clipboard.get_default(),
             settings: this.getSettings(),
             openSettings: this.openPreferences,
-            uuid: this.uuid
+            uuid: this.uuid,
+            path: this.path
         });
 
         Main.panel.addToStatusArea('clipboardIndicator', this.clipboardIndicator, 1);
@@ -957,7 +959,6 @@ const ClipboardIndicator = GObject.registerClass({
 
         // Favorite button
         let iconfav = new St.Icon({
-            icon_name: 'view-pin-symbolic',
             style_class: 'system-status-icon'
         });
 
@@ -972,6 +973,7 @@ const ClipboardIndicator = GObject.registerClass({
 
         menuItem.actor.add_child(icofavBtn);
         menuItem.icofavBtn = icofavBtn;
+        this.#updatePinButton(menuItem);
         menuItem.favoritePressId = icofavBtn.connect('clicked',
             () => this._favoriteToggle(menuItem)
         );
@@ -1045,6 +1047,21 @@ const ClipboardIndicator = GObject.registerClass({
         menuItem.actor.visible = this.#searchMatcher()(menuItem);
 
         return menuItem;
+    }
+
+    /**
+     * Shows the action the pin button performs: a pin on unpinned rows and
+     * a crossed-out pin on pinned ones. No icon theme provides the latter,
+     * so it ships with the extension (icons/pin-off-symbolic.svg); St
+     * recolours it like a themed symbolic icon because of its -symbolic
+     * file name.
+     */
+    #updatePinButton (menuItem) {
+        const pinned = menuItem.entry.isFavorite();
+        menuItem.icofavBtn.child.gicon = pinned
+            ? Gio.FileIcon.new(Gio.File.new_for_path(`${this.extension.path}/icons/pin-off-symbolic.svg`))
+            : Gio.ThemedIcon.new('view-pin-symbolic');
+        menuItem.icofavBtn.accessible_name = pinned ? _('Unpin') : _('Pin');
     }
 
     #updateOrnament (menuItem) {
