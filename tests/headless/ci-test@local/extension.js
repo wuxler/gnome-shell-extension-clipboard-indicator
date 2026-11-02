@@ -206,6 +206,12 @@ export default class CiTest extends Extension {
         const visibleOn = ([r, g, b, a]) => a >= 0x40 && (variant === 'light' ? r < 0x80 && g < 0x80 && b < 0x80 : r >= 0x80);
         const pin = buttons.find(btn => btn.style_class.includes('ci-pin-btn'));
         this._check(`pin icon visible (${variant})`, pin && visibleOn(rgba(pin)), `color=${pin && rgba(pin)}`);
+        // The pin icon now shows the state by its shape (pin / pin-off), so
+        // it uses the same colour as the other buttons of the row.
+        const otherColors = buttons.filter(b => b !== pin).map(b => rgba(b).join(','));
+        this._check('pin icon has the same colour as the other buttons',
+            pin && otherColors.every(c => c === rgba(pin).join(',')),
+            `pin=${pin && rgba(pin)} others=${JSON.stringify([...new Set(otherColors)])}`);
         const tag = row.tagLabel;
         this._check(`tag label visible (${variant})`, tag && visibleOn(rgba(tag)), `color=${tag && rgba(tag)}`);
 
