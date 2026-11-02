@@ -269,6 +269,57 @@ export default class CiTest extends Extension {
         await shot('visual-edit');
         tap(Clutter.KEY_Escape);
         await sleep(500);
+
+        // --- the pin button shows its action: pin, or pin-off when pinned --
+        const pinButtonOf = r => r.get_children().find(c => c instanceof St.Button && c.style_class.includes('ci-pin-btn'));
+        const iconOf = btn => {
+            const gicon = btn.child.gicon;
+            return gicon instanceof Gio.FileIcon ? gicon.get_file().get_basename() : gicon?.get_names?.()[0];
+        };
+        const findRow = () => {
+            const found = [];
+            const walk2 = actor => {
+                for (const child of actor.get_children()) {
+                    if (child instanceof PopupMenu.PopupMenuItem && child.entry) found.push(child);
+                    walk2(child);
+                }
+            };
+            walk2(ind.menu.box);
+            return found.find(r => r.entry.getStringValue() === 'visual check row');
+        };
+        if (!ind.menu.isOpen) ind.menu.open();
+        await sleep(500);
+        let target = findRow();
+        const before = [iconOf(pinButtonOf(target)), pinButtonOf(target).accessible_name];
+        ind._favoriteToggle(target);
+        await sleep(800);
+        target = findRow();
+        const pinBtn = pinButtonOf(target);
+        const after = [iconOf(pinBtn), pinBtn.accessible_name];
+        this._check('pin button shows pin, then pin-off once pinned',
+            before[0] === 'view-pin-symbolic' && before[1] === 'Pin' &&
+            target.entry.isFavorite() && after[0] === 'pin-off-symbolic.svg' && after[1] === 'Unpin',
+            `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+        await shot('visual-pinned');
+
+        // The shipped SVG must render, recoloured like a symbolic icon:
+        // some pixel inside the button contrasts with the menu.
+        const shooter = new Shell.Screenshot();
+        const pick = (x, y) => new Promise((res, rej) => shooter.pick_color(x, y, (sh, r) => {
+            try { res(sh.pick_color_finish(r)[1]); } catch (e) { rej(e); }
+        }));
+        const [px, py] = pinBtn.child.get_transformed_position();
+        const [pw, ph] = pinBtn.child.get_transformed_size();
+        let extreme = variant === 'light' ? 1 : 0;
+        for (let i = 1; i < 6; i++) {
+            for (let j = 1; j < 6; j++) {
+                const c = await pick(Math.round(px + pw * i / 6), Math.round(py + ph * j / 6));
+                const l = luminance([c.red, c.green, c.blue]);
+                extreme = variant === 'light' ? Math.min(extreme, l) : Math.max(extreme, l);
+            }
+        }
+        this._check(`pin-off icon renders in the ${variant} style`,
+            variant === 'light' ? extreme < 0.2 : extreme > 0.6, `extreme luminance=${extreme.toFixed(3)}`);
         log(`INFO style variant=${variant}`);
     }
 
