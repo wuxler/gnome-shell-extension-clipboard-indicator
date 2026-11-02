@@ -209,6 +209,28 @@ export default class CiTest extends Extension {
         const tag = row.tagLabel;
         this._check(`tag label visible (${variant})`, tag && visibleOn(rgba(tag)), `color=${tag && rgba(tag)}`);
 
+        // WCAG 1.4.11 contrast of the pin icon, from the colours the theme
+        // actually resolved: menu background, row and button backgrounds
+        // (which may be translucent), then the icon's foreground.
+        const toRgba = c => [c.red, c.green, c.blue, c.alpha / 255];
+        const over = (fg, bg) => [0, 1, 2].map(i => fg[i] * fg[3] + bg[i] * (1 - fg[3])).concat([1]);
+        const luminance = ([r, g, b]) => {
+            const f = v => (v /= 255) <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+            return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+        };
+        const contrast = (a, b) => {
+            const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+            return (hi + 0.05) / (lo + 0.05);
+        };
+        const pinContrast = () => {
+            let bg = toRgba(ind.menu.box.get_theme_node().get_background_color());
+            for (const layer of [row, pin])
+                bg = over(toRgba(layer.get_theme_node().get_background_color()), bg);
+            return contrast(over(toRgba(pin.get_theme_node().get_foreground_color()), bg), bg);
+        };
+        const pinNormal = pinContrast();
+        let pinHovered = null;
+
         await shot('visual-normal');
         // Real pointer motion through a virtual device, so crossing events
         // and hover tracking behave as with a mouse.
@@ -222,11 +244,15 @@ export default class CiTest extends Extension {
             moveTo(bx + bw / 2, by + bh / 2);
             await sleep(500);
             await shot(`visual-hover-${i}`);
+            if (btn === pin) pinHovered = pinContrast();
             const others = buttons.filter(o => o !== btn).map(bgAlpha);
             hoverOk.push(bgAlpha(btn) > 0 && others.every(alpha => alpha === 0));
         }
         this._check('hovered action button is highlighted, others are not',
             hoverOk.length > 0 && hoverOk.every(x => x), JSON.stringify(hoverOk));
+        this._check(`pin icon contrast at least 3:1 (${variant})`,
+            pinNormal >= 3 && pinHovered !== null && pinHovered >= 3,
+            `normal=${pinNormal.toFixed(2)} hovered=${pinHovered?.toFixed(2)}`);
         moveTo(10, 500);
         await sleep(400);
         this._check('no highlight after the pointer leaves', buttons.every(btn => bgAlpha(btn) === 0));

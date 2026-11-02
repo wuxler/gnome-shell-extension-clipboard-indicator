@@ -3,9 +3,14 @@
    uses translucent white in places, which is invisible on a light one. */
 @import url("stylesheet.css");
 
-/* Pin button of unpinned rows. */
+/* Pin button of unpinned rows; see stylesheet.css. */
 .ci-main-menu-section StButton.ci-pin-btn {
-    color: rgba(0,0,0,0.35);
+    color: rgba(0,0,0,0.5);
+}
+
+.ci-main-menu-section StButton.ci-pin-btn:hover,
+.ci-main-menu-section StButton.ci-pin-btn:focus {
+    color: rgba(0,0,0,0.75);
 }
 
 .ci-tag-label {
