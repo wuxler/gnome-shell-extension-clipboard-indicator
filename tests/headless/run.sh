@@ -136,7 +136,8 @@ leftover=0; oom_kills=0
 if [ -n "$CG" ] && [ -d "/sys/fs/cgroup$CG" ]; then
   leftover=$(wc -l < "/sys/fs/cgroup$CG/cgroup.procs")
   [ "$leftover" -gt 0 ] && ps -o pid=,rss=,args= -p "$(paste -sd, "/sys/fs/cgroup$CG/cgroup.procs")" > "$T/leftover.txt" 2>/dev/null
-  oom_kills=$(awk '$1 == "oom_kill" {print $2}' "/sys/fs/cgroup$CG/memory.events")
+  # The scope may be collected between the checks above and this read.
+  oom_kills=$(awk '$1 == "oom_kill" {print $2}' "/sys/fs/cgroup$CG/memory.events" 2>/dev/null)
 fi
 # The scope is garbage-collected once its last process exits, so OOM kills
 # are also counted from the journal.
