@@ -63,8 +63,16 @@
     max-height:450px;
 }
 
+/* Pin button of unpinned rows: dimmer than a pinned row's, but at least
+   3:1 against the menu and the hovered row (WCAG 1.4.11). */
 .ci-main-menu-section StButton.ci-pin-btn {
-    color: rgba(255,255,255,0.3);
+    color: rgba(255,255,255,0.5);
+}
+
+/* The hover highlight brightens the background, so the icon brightens too. */
+.ci-main-menu-section StButton.ci-pin-btn:hover,
+.ci-main-menu-section StButton.ci-pin-btn:focus {
+    color: rgba(255,255,255,0.8);
 }
 
 .clipboard-hidden {
