@@ -23,7 +23,10 @@
 > `~/.cache/clipboard-indicator@tudmotu.com/` to
 > `~/.cache/clipboard-indicator@wuxler.github.io/`.
 >
-> Install: `make install` (requires `msgfmt`), then log out and back in.
+> Install: download the zip from [Releases](https://github.com/wuxler/gnome-shell-extension-clipboard-indicator/releases),
+> run `gnome-extensions install --force <zip>`, then log out and back in.
+> From source: `make install` (requires `msgfmt`).
+> Releases: see [`RELEASING.md`](RELEASING.md).
 > Tests: see [`tests/headless/`](tests/headless/README.md).
 
 [<img src="https://raw.githubusercontent.com/andyholmes/gnome-shell-extensions-badge/eb9af9a1c6f04eb060cb01de6aeb5c84232cd8c0/get-it-on-ego.svg?sanitize=true" width="180" alt="Get it on GNOME Extensions">](https://extensions.gnome.org/extension/779/clipboard-indicator/)

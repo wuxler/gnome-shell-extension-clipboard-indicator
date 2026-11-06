@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  # Lets the release workflow run the same checks on the tagged commit.
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build tools
+        run: sudo apt-get -qq update && sudo apt-get -qq -y install libglib2.0-dev-bin zip
+      - name: Build the zip
+        run: make bundle
+      - name: Check metadata
+        run: |
+          jq -e '."version-name" | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")' metadata.json
+          jq -e '.uuid == "clipboard-indicator@wuxler.github.io"' metadata.json
+          unzip -l clipboard-indicator@wuxler.github.io.zip | grep -q ' metadata.json$'
+          unzip -l clipboard-indicator@wuxler.github.io.zip | grep -q ' schemas/gschemas.compiled$'
+
+  headless:
+    name: GNOME ${{ matrix.gnome }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { gnome: "46", image: "ubuntu:24.04" }
+          - { gnome: "47", image: "fedora:41" }
+          - { gnome: "48", image: "fedora:42" }
+          - { gnome: "49", image: "fedora:43" }
+          - { gnome: "50", image: "fedora:44" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run the headless tests
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          docker run --rm --memory=3g --memory-swap=3g \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP/results:/results" \
+            "$IMAGE" /src/tests/headless/in-container.sh
+      - name: Keep logs and screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: headless-gnome-${{ matrix.gnome }}
+          path: ${{ runner.temp }}/results
+          retention-days: 14

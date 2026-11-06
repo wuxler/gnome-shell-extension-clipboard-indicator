@@ -1,0 +1,57 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes a GitHub Release with the installable zip.
+# See RELEASING.md.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check that the tag matches metadata.json and master
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(jq -r '."version-name"' metadata.json)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match version-name $version in metadata.json"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::Tag $TAG is not on master"
+            exit 1
+          fi
+
+  ci:
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build tools
+        run: sudo apt-get -qq update && sudo apt-get -qq -y install libglib2.0-dev-bin zip
+      - name: Build the zip
+        run: |
+          make bundle
+          sha256sum clipboard-indicator@wuxler.github.io.zip > clipboard-indicator@wuxler.github.io.zip.sha256
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" \
+            clipboard-indicator@wuxler.github.io.zip \
+            clipboard-indicator@wuxler.github.io.zip.sha256

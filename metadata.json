@@ -11,5 +11,6 @@
     "description": "Fork of Clipboard Indicator that loads clipboard history lazily and caps the image cache, so a large history cannot stall GNOME Shell startup. Based on Tudmotu/gnome-shell-extension-clipboard-indicator.",
     "url": "https://github.com/wuxler/gnome-shell-extension-clipboard-indicator",
     "gettext-domain": "clipboard-indicator",
-    "settings-schema": "org.gnome.shell.extensions.clipboard-indicator"
+    "settings-schema": "org.gnome.shell.extensions.clipboard-indicator",
+    "version-name": "1.0.0"
 }
