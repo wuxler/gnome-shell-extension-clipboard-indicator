@@ -19,6 +19,8 @@
 #                    corrupt); do not fail on errors logged by the extension
 #
 #   CI_MEMORY_MAX=3G memory limit of the run's systemd scope
+#   CI_NO_SCOPE=1    no systemd scope, for containers: the container itself
+#                    must set the memory limit and is what cleans up
 #
 # Exit status: 0 only if the shell finished starting, nothing in the run's
 # scope was OOM-killed and, with the test
@@ -123,8 +125,10 @@ stop_scope () {
 trap stop_scope EXIT
 
 start=$(date +%s.%N)
-systemd-run --user --scope --quiet --collect --unit="$UNIT" \
-    -p MemoryMax="${CI_MEMORY_MAX:-3G}" -p MemorySwapMax=0 \
+SCOPE=(systemd-run --user --scope --quiet --collect --unit="$UNIT"
+    -p MemoryMax="${CI_MEMORY_MAX:-3G}" -p MemorySwapMax=0)
+[ "${CI_NO_SCOPE:-0}" = 1 ] && SCOPE=()
+"${SCOPE[@]}" \
   env XDG_CONFIG_HOME="$T/config" XDG_DATA_HOME="$T/data" XDG_CACHE_HOME="$T/cache" \
     GSETTINGS_BACKEND=keyfile XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wl-ci-$TAG" GDK_BACKEND=wayland CI_SHOT="$T/menu.png" CI_SEEDED=$([ "$SEED" != - ] && echo 1 || echo 0) \
     timeout "$TO" dbus-run-session -- gnome-shell --headless --virtual-monitor 1920x1080 \

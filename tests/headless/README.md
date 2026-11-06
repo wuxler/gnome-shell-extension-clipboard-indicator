@@ -30,6 +30,16 @@ CI_SCENARIO=gtype EXTRA_EXT=./upstream-v71:clipboard-indicator@tudmotu.com \
 CI_SCENARIO=visual ./run.sh visual - - - 1 45 $'\n[org/gnome/desktop/interface]\ncolor-scheme=\'prefer-light\''
 ```
 
+Other GNOME versions run in a throwaway container, which CI also uses (see
+`.github/workflows/ci.yml` for the image of each version). The container's
+memory limit replaces the systemd scope:
+
+```bash
+docker run --rm --memory=3g --memory-swap=3g \
+  -v "$PWD/../..:/src:ro" -v /tmp/ci-results:/results \
+  fedora:44 /src/tests/headless/in-container.sh
+```
+
 `run.sh` exits non-zero unless the shell finished starting and, with the
 driver, it reported `END ... fail=0` and the extension logged no errors.
 
