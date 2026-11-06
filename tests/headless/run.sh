@@ -31,7 +31,7 @@ set -u
 H=$(cd "$(dirname "$0")" && pwd)
 TAG=$1; EXT=${2:--}; UUID=${3:--};
 [ "$EXT" = - ] && EXT=$H/build
-[ "$UUID" = - ] && UUID=clipboard-indicator@wuxler.github.com
+[ "$UUID" = - ] && UUID=clipboard-indicator@wuxler.github.io
  SEED=${4:--}; WITHTEST=${5:-0}; TO=${6:-25}; EXTRA=${7:-}
 T=$H/runs/$TAG
 # Private runtime dir: the shell writes its crash-protection marker and

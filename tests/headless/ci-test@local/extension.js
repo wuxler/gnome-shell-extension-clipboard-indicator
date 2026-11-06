@@ -12,7 +12,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const UUID = 'clipboard-indicator@wuxler.github.com';
+const UUID = 'clipboard-indicator@wuxler.github.io';
 const CLIP = St.ClipboardType.CLIPBOARD;
 const log = msg => console.log(`CI-TEST ${msg}`);
 const sleep = ms => new Promise(r => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {

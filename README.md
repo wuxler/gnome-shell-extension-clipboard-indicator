@@ -1,6 +1,6 @@
 # 📋 Clipboard Indicator
 
-> **About this fork** (`clipboard-indicator@wuxler.github.com`)
+> **About this fork** (`clipboard-indicator@wuxler.github.io`)
 >
 > A large image history can keep GNOME Shell from finishing startup:
 > after login the desktop is drawn but mouse and keyboard do nothing
@@ -21,7 +21,7 @@
 > it with the upstream build. Settings are shared with upstream; the cache
 > directory is not. To keep the upstream history, copy
 > `~/.cache/clipboard-indicator@tudmotu.com/` to
-> `~/.cache/clipboard-indicator@wuxler.github.com/`.
+> `~/.cache/clipboard-indicator@wuxler.github.io/`.
 >
 > Install: `make install` (requires `msgfmt`), then log out and back in.
 > Tests: see [`tests/headless/`](tests/headless/README.md).

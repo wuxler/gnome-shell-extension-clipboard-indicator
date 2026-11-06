@@ -6,7 +6,7 @@
         "49",
         "50"
     ],
-    "uuid": "clipboard-indicator@wuxler.github.com",
+    "uuid": "clipboard-indicator@wuxler.github.io",
     "name": "Clipboard Indicator (lazy history fork)",
     "description": "Fork of Clipboard Indicator that loads clipboard history lazily and caps the image cache, so a large history cannot stall GNOME Shell startup. Based on Tudmotu/gnome-shell-extension-clipboard-indicator.",
     "url": "https://github.com/wuxler/gnome-shell-extension-clipboard-indicator",
