@@ -1,5 +1,6 @@
 MODULES = *.js locale/*/LC_MESSAGES/*.mo metadata.json stylesheet*.css icons/ LICENSE.rst README.md schemas/
-INSTALLPATH=~/.local/share/gnome-shell/extensions/clipboard-indicator@wuxler.github.com/
+UUID = clipboard-indicator@wuxler.github.io
+INSTALLPATH=~/.local/share/gnome-shell/extensions/$(UUID)/
 
 all: compile-locales compile-settings
 
@@ -25,5 +26,7 @@ nested-session:
 		MUTTER_DEBUG_DUMMY_MODE_SPECS=2048x1536 \
 		MUTTER_DEBUG_DUMMY_MONITOR_SCALES=2 gnome-shell --nested --wayland
 
-bundle: all
-	zip -FSr bundle.zip $(MODULES)
+# Uses the .mo files tracked in git, so msgfmt is not needed.
+bundle: compile-settings
+	rm -f $(UUID).zip
+	zip -qr $(UUID).zip $(MODULES)

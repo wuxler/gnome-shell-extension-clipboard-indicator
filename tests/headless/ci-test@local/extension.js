@@ -12,7 +12,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const UUID = 'clipboard-indicator@wuxler.github.com';
+const UUID = 'clipboard-indicator@wuxler.github.io';
 const CLIP = St.ClipboardType.CLIPBOARD;
 const log = msg => console.log(`CI-TEST ${msg}`);
 const sleep = ms => new Promise(r => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
@@ -94,7 +94,14 @@ export default class CiTest extends Extension {
         this._fail = 0;
         const run = () => this._run()
             .catch(e => this._check('no exception', false, `${e}\n${e.stack}`))
-            .finally(() => log(`END pass=${this._pass} fail=${this._fail}`));
+            .finally(() => {
+                log(`END pass=${this._pass} fail=${this._fail}`);
+                // The run's result is known: do not wait for run.sh's timeout.
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+                    global.context.terminate();
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
         if (Main.layoutManager._startingUp) {
             this._t0 = 0;
             const id = Main.layoutManager.connect('startup-complete', () => {
@@ -165,8 +172,16 @@ export default class CiTest extends Extension {
         const up = await waitFor(() => this._ind() !== undefined, 15000);
         if (!up) return this._check('indicator present', false);
         const ind = this._ind();
-        St.Clipboard.get_default().set_text(CLIP, 'visual check row');
-        await sleep(1500);
+        // The indicator exists before it starts listening for clipboard
+        // changes, so keep copying until the entry shows up.
+        await waitFor(() => {
+            St.Clipboard.get_default().set_text(CLIP, 'visual check row');
+            return ind._history?.some(e => e.getStringValue() === 'visual check row');
+        }, 15000);
+        // Newer GNOME versions start in the overview, and closing it would
+        // also close the menu.
+        Main.overview.hide();
+        await waitFor(() => !Main.overview.visible && !Main.overview.animationInProgress, 5000);
         ind.menu.open();
         await sleep(2500);
 
@@ -243,12 +258,29 @@ export default class CiTest extends Extension {
         const seat = Clutter.get_default_backend().get_default_seat();
         const pointer = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
         const moveTo = (x, y) => pointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y);
+        // A new virtual device can drop its first events.
+        moveTo(10, 500);
+        await sleep(300);
+        moveTo(11, 500);
+        await sleep(300);
+        // On newer GNOME versions the new input device closes the open menu.
+        if (!ind.menu.isOpen) {
+            log('INFO reopening the menu after creating the virtual pointer');
+            ind.menu.open();
+            await sleep(1000);
+        }
         const hoverOk = [];
         for (const [i, btn] of buttons.entries()) {
             const [bx, by] = btn.get_transformed_position();
             const [bw, bh] = btn.get_transformed_size();
-            moveTo(bx + bw / 2, by + bh / 2);
-            await sleep(500);
+            // A motion right after the menu opened can get lost on a slow
+            // software renderer, so move again if the button did not react.
+            for (let attempt = 0; attempt < 3 && bgAlpha(btn) === 0; attempt++) {
+                moveTo(bx + bw / 2 + attempt, by + bh / 2);
+                await waitFor(() => bgAlpha(btn) > 0, 700);
+            }
+            // Let the previous button's highlight fade out.
+            await sleep(300);
             await shot(`visual-hover-${i}`);
             if (btn === pin) pinHovered = pinContrast();
             const others = buttons.filter(o => o !== btn).map(bgAlpha);
@@ -269,6 +301,21 @@ export default class CiTest extends Extension {
             keyboard.notify_keyval(GLib.get_monotonic_time(), keyval, Clutter.KeyState.PRESSED);
             keyboard.notify_keyval(GLib.get_monotonic_time(), keyval, Clutter.KeyState.RELEASED);
         };
+        moveTo(10, 500);
+        await sleep(300);
+        if (!ind.menu.isOpen) {
+            ind.menu.open();
+            await sleep(1000);
+        }
+        // A new virtual device can drop its first events, and Shift does
+        // nothing in the menu.
+        tap(Clutter.KEY_Shift_L);
+        await sleep(300);
+        if (!ind.menu.isOpen) {
+            log('INFO reopening the menu after creating the virtual keyboard');
+            ind.menu.open();
+            await sleep(1000);
+        }
         row.grab_key_focus();
         tap(Clutter.KEY_e);
         await sleep(1000);
@@ -519,6 +566,32 @@ export default class CiTest extends Extension {
         await sleep(800);
         this._check('next/previous entry cycle', afterNext && afterNext !== before &&
             ind._selectedEntry === before);
+
+        // --- paste on select keeps the chosen entry selected -----------------
+        for (const moveFirst of [false, true]) {
+            settings.set_boolean('paste-on-select', true);
+            settings.set_boolean('move-item-first', moveFirst);
+            await sleep(200);
+            ind.menu.open();
+            await sleep(500);
+            const chosen = ind._history.find(e => e.isText() && !e.isFavorite() &&
+                e !== ind._selectedEntry && e !== ind._history.at(-1) && ind._menuItems.has(e));
+            if (!chosen) {
+                log('INFO skipping paste on select check: no other text entry');
+                break;
+            }
+            ind._menuItems.get(chosen).activate(Clutter.get_current_event());
+            await sleep(1000);
+            const pasted = await clipboardText();
+            this._check(`paste on select keeps the entry selected (move first ${moveFirst})`,
+                ind._selectedEntry === chosen && pasted === chosen.getStringValue() &&
+                ind.preventIndicatorUpdate === false &&
+                (!moveFirst || ind._history.at(-1) === chosen),
+                `clipboard=${JSON.stringify(pasted)}`);
+        }
+        settings.set_boolean('paste-on-select', false);
+        settings.set_boolean('move-item-first', false);
+        await sleep(200);
 
         // --- a slow image read must not override a later selection --------
         {
