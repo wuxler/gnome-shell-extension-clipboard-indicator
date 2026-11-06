@@ -21,7 +21,7 @@ if [ "$(id -u)" = 0 ]; then
     export DEBIAN_FRONTEND=noninteractive
     { apt-get -qq update && apt-get -qq -y install --no-install-recommends gnome-shell \
         dbus libglib2.0-dev-bin libglib2.0-bin python3 python3-pil procps \
-        libgl1-mesa-dri adwaita-icon-theme gnome-shell-extension-prefs; } >/dev/null || exit 2
+        libgl1-mesa-dri librsvg2-common adwaita-icon-theme gnome-shell-extension-prefs; } >/dev/null || exit 2
   fi
   mkdir -p /run/dbus && rm -f /run/dbus/pid && dbus-daemon --system --fork
   # No logind in the container: without this directory the shell uses its
@@ -59,6 +59,11 @@ for s in ${CI_SCENARIOS:-empty seeded visual-light visual-dark corrupt}; do
     *) echo "unknown scenario $s"; rc=1 ;;
   esac
 done
-[ -d /results ] && cp -r runs/. /results/ 2>/dev/null
+# Only logs and screenshots: the runs' cache and config directories are large
+# and partly unreadable to whoever collects the results.
+if [ -d /results ]; then
+  (cd runs && find . \( -name shell.log -o -name '*.png' \) -exec cp --parents -t /results {} +)
+  chmod -R a+rX /results
+fi
 echo "in-container: rc=$rc"
 exit $rc

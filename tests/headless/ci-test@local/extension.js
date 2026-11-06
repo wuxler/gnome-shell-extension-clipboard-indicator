@@ -273,8 +273,14 @@ export default class CiTest extends Extension {
         for (const [i, btn] of buttons.entries()) {
             const [bx, by] = btn.get_transformed_position();
             const [bw, bh] = btn.get_transformed_size();
-            moveTo(bx + bw / 2, by + bh / 2);
-            await sleep(500);
+            // A motion right after the menu opened can get lost on a slow
+            // software renderer, so move again if the button did not react.
+            for (let attempt = 0; attempt < 3 && bgAlpha(btn) === 0; attempt++) {
+                moveTo(bx + bw / 2 + attempt, by + bh / 2);
+                await waitFor(() => bgAlpha(btn) > 0, 700);
+            }
+            // Let the previous button's highlight fade out.
+            await sleep(300);
             await shot(`visual-hover-${i}`);
             if (btn === pin) pinHovered = pinContrast();
             const others = buttons.filter(o => o !== btn).map(bgAlpha);
